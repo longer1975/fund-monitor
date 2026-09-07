@@ -99,7 +99,7 @@ HEADLESS = True
 # 第一次运行是否发送当前已有公告
 # False：第一次只建立历史记录，不发送旧公告
 # True：第一次也发送当前公告
-FIRST_RUN_NOTIFY = True
+FIRST_RUN_NOTIFY = False
 
 # 已发送公告记录（GitHub Actions 中随仓库提交持久化）
 SEEN_FILE = "seen_announcements.json"
