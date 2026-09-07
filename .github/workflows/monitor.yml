@@ -41,12 +41,60 @@ jobs:
           name: excel
           path: 限额公告.xlsx
           if-no-files-found: ignore
-      - name: 心跳保活 + 保存历史记录
+      - name: 保存历史记录（合并去重，避免并发运行时git冲突）
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          date > .last-run
-          git add .last-run seen_announcements.json || true
-          git diff --cached --quiet || git commit -m "keepalive [skip ci]"
-          git pull --rebase origin main   # 防止与你手动改代码时撞车
-          git push
+
+          for attempt in 1 2 3; do
+            git fetch origin main
+
+            # 把"远端最新的已见记录"和"本轮新增的已见记录"做并集合并，
+            # 不依赖git的文本行级合并——两组"已见公告"取并集永远是安全的，
+            # 不会因为两次运行前后脚碰撞而丢失任何一边新增的记录。
+            python3 - <<'PYEOF'
+import json
+import subprocess
+
+local_path = "seen_announcements.json"
+
+try:
+    with open(local_path, "r", encoding="utf-8") as f:
+        local_data = set(json.load(f))
+except Exception:
+    local_data = set()
+
+try:
+    remote_raw = subprocess.check_output(
+        ["git", "show", "origin/main:seen_announcements.json"]
+    )
+    remote_data = set(json.loads(remote_raw))
+except Exception:
+    remote_data = set()
+
+merged = sorted(local_data | remote_data)
+with open("/tmp/merged_seen.json", "w", encoding="utf-8") as f:
+    json.dump(merged, f, ensure_ascii=False, indent=2)
+PYEOF
+
+            # 以远端最新提交为基准重置，避免任何历史分叉，
+            # 再把合并好的结果写回工作区
+            git reset --hard origin/main
+            cp /tmp/merged_seen.json seen_announcements.json
+            git add seen_announcements.json
+
+            if git diff --cached --quiet; then
+              echo "无新增记录需要提交"
+              break
+            fi
+
+            git commit -m "update seen records [skip ci]"
+
+            if git push origin HEAD:main; then
+              echo "推送成功"
+              break
+            fi
+
+            echo "推送失败（可能有并发写入），第${attempt}次重试..."
+            sleep $((attempt * 5))
+          done
