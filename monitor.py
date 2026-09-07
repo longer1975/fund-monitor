@@ -1,16 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-QDII 基金限额公告监控脚本 v3.3
-- 逐只打开天天基金公告页,抓取近 N 天限额相关公告
-- ★ v3.3修复：v3.2 的"页面是否加载完成"判定和公告提取都严格依赖
-  <table><tr><td> 结构，但公告列表实际很可能是 <ul><li> 或其他容器，
-  导致 count_dated_rows() 永远为0、被误判为"页面没加载"，重试3次后
-  放弃，误报"没有找到公告"（银华、宝盈等基金实际有公告但抓不到就是这个原因）。
-  v3.3 改回不假设具体DOM结构的通用抓取：抓所有<a>标签，找其最近的
-  行容器(tr/li/其他)，从容器整体文字里解析日期，兼容各种页面结构。
+QDII 基金限额公告监控脚本 v3.4
+- 通用抓取:不假设 table/ul/li 结构,抓所有<a>标签及其行容器解析日期
+- ★ v3.4:窗口缩至2天;新增黑名单过滤,排除QDII境外休市类常规停牌通知
+  (规律:常规停牌公告标题几乎总是"申购、赎回"成对出现,
+   真正的限额调整公告标题几乎不会同时提到赎回)
 - 关键词采用宽覆盖子串匹配(兼容"限购/限大额/大额申购"等各种写法)
 - 支持翻页抓取(最多3页,防公告大户单页漏抓)
-- 未命中关键词时打印窗口内全部公告标题(诊断漏抓)
+- 未命中关键词时打印窗口内全部公告标题(诊断漏抓/误滤)
 - 与 seen_announcements.json 对比,新公告推送飞书
 - 推送成功后才更新已见记录(事务性,失败自动下轮重试)
 """
@@ -37,7 +34,7 @@ SEEN_RECORD_FILE = APP_DIR / "seen_announcements.json"  # 已推送记录(持久
 EXCEL_FILE = APP_DIR / "近5天限额公告.xlsx"
 LOG_FILE = APP_DIR / "fund_monitor.log"
 
-RECENT_DAYS = 5            # 检查窗口:近几天的公告
+RECENT_DAYS = 2            # 检查窗口:近几天的公告(★v3.4:5→2,减少噪音)
 PAGE_TIMEOUT = 30000       # 单页加载超时(毫秒)
 MAX_ATTEMPTS = 3           # 页面异常时最大尝试次数
 RETRY_WAIT_SECONDS = 2     # 重试前的等待秒数
@@ -54,7 +51,7 @@ REQUEST_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9",
 }
 
-# 限额公告关键词(子串匹配,命中任意一个即保留,覆盖各种写法)
+# 限额类关键词(白名单,标题命中任意一个才可能被保留)
 LIMIT_KEYWORDS = [
     "限购", "限额", "限大额",
     "大额申购", "限制申购", "申购限制",
@@ -64,9 +61,22 @@ LIMIT_KEYWORDS = [
     "规模上限", "单日上限",
 ]
 
+# 常规停牌通知特征(★v3.4新增黑名单,命中即排除,优先级高于白名单)
+# 依据:QDII境外市场节假日/无法估值时发布的常规暂停公告,
+# 标题几乎总是"申购、赎回"成对出现,且常带节假日/休市等字眼;
+# 真正的限额调整公告标题几乎不会同时提到赎回。
+ROUTINE_SUSPEND_WORDS = ["节假日", "休市", "无法估值", "非交易日"]
+
 
 def is_limit_title(title):
-    """判断公告标题是否限额相关(子串匹配,覆盖面比正则广)"""
+    """判断公告标题是否为真正的限额调整(先过黑名单排除常规停牌,再过白名单)"""
+    # 黑名单1:标题同时出现"申购"和"赎回" → QDII境外休市常规暂停公告
+    if "申购" in title and "赎回" in title:
+        return False
+    # 黑名单2:节假日/休市/无法估值/非交易日等常规通知
+    if any(w in title for w in ROUTINE_SUSPEND_WORDS):
+        return False
+    # 白名单:限额类关键词
     return any(k in title for k in LIMIT_KEYWORDS)
 
 
@@ -207,9 +217,8 @@ def parse_date(text):
     """
     从文字中提取日期，兼容多种写法：
     2026-08-29 / 2026/08/29 / 2026.08.29 / 2026年08月29日
-    ★ v3.3：不再假设日期一定单独出现在某个固定的<td>里，
-    而是从任意一段文字（标题、整行文字）里用正则找日期，
-    这样无论页面用table还是ul/li排版都能兼容。
+    不假设日期一定单独出现在某个固定的<td>里，
+    从任意一段文字（标题、整行文字）里用正则找日期。
     """
     text = clean_text(text)
     match = re.search(r"(20\d{2})[-年/.](\d{1,2})[-月/.](\d{1,2})", text)
@@ -277,9 +286,6 @@ def extract_raw_items(page):
     通用抓取：只找页面里所有<a>标签，连同它所在的行/列表项容器
     (tr、li、常见公告容器class、或直接父元素)一起返回原始文字，
     不对页面具体是table还是ul/li做任何假设。
-
-    ★ v3.3核心修复点：v3.2 只认<table><tr><td>结构，
-    如果公告列表实际是<ul><li>或其他容器就会一条都抓不到。
     """
     try:
         raw_items = page.evaluate(
@@ -317,9 +323,9 @@ def extract_raw_items(page):
 def parse_records_from_raw_items(raw_items, code, fund_name, source_url, start_date, end_date):
     """
     从 extract_raw_items 抓到的原始条目里，解析出：
-    - dated_item_count：窗口无关的、能解析出日期的条目总数（用于判断页面是否真的加载了公告数据）
-    - window_titles：落在日期窗口内的全部公告标题（无论是否命中关键词，用于诊断漏抓）
-    - records：落在日期窗口内 且 命中限额关键词的公告（真正要推送/导出的）
+    - dated_item_count：能解析出日期的条目总数（判断页面是否真的加载了公告数据）
+    - window_titles：落在日期窗口内的全部公告标题（无论是否命中关键词，用于诊断）
+    - records：落在日期窗口内 且 命中限额关键词（且未被黑名单排除）的公告
     """
     dated_item_count = 0
     window_titles = []
@@ -341,8 +347,7 @@ def parse_records_from_raw_items(raw_items, code, fund_name, source_url, start_d
         if announcement_date is None:
             continue
 
-        # 只要能解析出日期，就算作"页面确实加载出了公告数据"的证据，
-        # 不管这条公告是否落在时间窗口内、是否命中关键词
+        # 只要能解析出日期，就算作"页面确实加载出了公告数据"的证据
         dated_item_count += 1
 
         if not (start_date <= announcement_date <= end_date):
@@ -407,139 +412,4 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
                 raw_items, code, fund_name, source_url, start_date, end_date
             )
 
-            # ★ 核心判定:公告数据是否真的加载了（不限定table还是ul/li结构）
-            if dated_item_count == 0:
-                if attempt < MAX_ATTEMPTS:
-                    logger.info("  第%d次页面异常（未解析到任何带日期的公告条目），%d秒后重试...",
-                                attempt, RETRY_WAIT_SECONDS)
-                    time.sleep(RETRY_WAIT_SECONDS)
-                    continue
-                save_debug_snapshot(page, code, "tablefail")
-                logger.info("没有找到额度相关公告：%s %s（连续%d次页面异常，已存debug截图）",
-                            code, fund_name, MAX_ATTEMPTS)
-                return []
-
-            # 第1页正常:翻页继续抓(最多 MAX_PAGES 页,翻不动就停)
-            for _page_no in range(2, MAX_PAGES + 1):
-                try:
-                    next_btn = page.locator("a", has_text="下一页")
-                    if next_btn.count() == 0:
-                        break
-                    next_btn.first.click()
-                    page.wait_for_timeout(1200)  # 翻页后等Ajax刷新
-
-                    more_raw_items = extract_raw_items(page)
-                    _more_dated, more_window_titles, more_records = parse_records_from_raw_items(
-                        more_raw_items, code, fund_name, source_url, start_date, end_date
-                    )
-                    records.extend(more_records)
-                    window_titles.extend(more_window_titles)
-                except Exception:
-                    break  # 翻页失败静默停止,不影响已抓到的
-
-            # 翻页可能造成跨页重复,去重
-            unique, seen_keys = [], set()
-            for r in records:
-                k = (r["基金代码"], r["公告日期"], r["公告标题"])
-                if k not in seen_keys:
-                    seen_keys.add(k)
-                    unique.append(r)
-            records = unique
-
-            if records:
-                logger.info("找到额度相关公告：%s %s", code, fund_name)
-                for r in records:
-                    logger.info("- %s %s", r["公告日期"], r["公告标题"])
-            else:
-                # 有日期条目但没命中关键词 = 打出窗口内全部标题,便于诊断
-                shown = set()
-                for d, t in window_titles:
-                    if (d, t) in shown:
-                        continue
-                    shown.add((d, t))
-                    logger.info("  窗口内公告(未命中关键词)：%s %s", d, t)
-                logger.info("没有找到额度相关公告：%s %s", code, fund_name)
-            return records
-
-        except Exception as error:
-            if attempt < MAX_ATTEMPTS:
-                logger.info("  查询异常(%s)，%d秒后重试...", error, RETRY_WAIT_SECONDS)
-                time.sleep(RETRY_WAIT_SECONDS)
-            else:
-                logger.info("查询失败：%s %s", code, error)
-    return []
-
-
-# ============================================================
-# 九、全量查询
-# ============================================================
-def query_all_funds(page, fund_dict, start_date, end_date):
-    total = len(fund_dict)
-    all_records = []
-    for idx, (code, name) in enumerate(fund_dict.items(), start=1):
-        all_records.extend(
-            query_one_fund(page, idx, total, code, name, start_date, end_date)
-        )
-        time.sleep(random.uniform(1.0, 2.0))  # 每只之间随机间隔,降低风控概率
-    return all_records
-
-
-# ============================================================
-# 十、主流程
-# ============================================================
-def main():
-    start_date = fetch_recent_start_date(RECENT_DAYS)
-    end_date = datetime.date.today()
-    logger.info("本次检查窗口：%s ~ %s", start_date, end_date)
-
-    fund_dict = load_fund_dict()
-    seen = load_seen_records()
-
-    all_records = []
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled",
-                  "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = browser.new_context(user_agent=REQUEST_HEADERS["User-Agent"])
-        page = context.new_page()
-        try:
-            all_records = query_all_funds(page, fund_dict, start_date, end_date)
-        finally:
-            browser.close()
-
-    # 保存 Excel(无论是否有公告都生成,便于 artifact 查看全量)
-    df = pd.DataFrame(all_records, columns=["基金代码", "基金名称", "公告日期", "公告标题", "公告链接"])
-    df.to_excel(EXCEL_FILE, index=False)
-    logger.info("Excel已保存：%s", EXCEL_FILE)
-
-    # 对比已见记录,筛出新公告
-    new_records = []
-    for r in all_records:
-        key = f"{r['基金代码']}|{r['公告日期']}|{r['公告标题']}"
-        if key not in seen:
-            r["_key"] = key
-            new_records.append(r)
-
-    if not new_records:
-        logger.info("本轮没有新的限额公告")
-        return
-
-    logger.info("发现新的限额公告：%d条", len(new_records))
-    for r in new_records:
-        logger.info("- %s %s %s", r["基金代码"], r["公告日期"], r["公告标题"])
-
-    try:
-        send_feishu(new_records)
-    except Exception as e:
-        logger.info("推送失败(%s),记录不更新,下轮自动重试", e)
-        return
-
-    # ★ 只有推送成功才写记录(事务性)
-    seen.update(r["_key"] for r in new_records)
-    save_seen_records(seen)
-
-
-if __name__ == "__main__":
-    main()
+            # ★ 
