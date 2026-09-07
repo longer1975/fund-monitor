@@ -1,17 +1,15 @@
 name: fund-monitor
-
 on:
+  repository_dispatch:
+    types: [fund-monitor-trigger]   # cron-job.org 调用时用这个事件名
   schedule:
-    - cron: "7,17,27,37,47,57 * * * *"   # 每10分钟，错峰避开整点高峰
+    - cron: "3,33 * * * *"          # 兜底：每30分钟一次，防外部服务本身失效
   workflow_dispatch:
-
 permissions:
   contents: write
-
 concurrency:
   group: fund-monitor
   cancel-in-progress: false
-
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -19,36 +17,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0                  # ★ 完整历史,保证 rebase/push 稳定
-
+          fetch-depth: 0   # 完整历史,保证 rebase/push 稳定
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: 缓存 Playwright 浏览器
         uses: actions/cache@v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
-
       - name: 安装依赖
         run: |
           pip install -r requirements.txt
           playwright install --with-deps chromium
-
       - name: 运行监控
         env:
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
         run: python monitor.py
-
       - name: 上传Excel
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: excel
-          path: 近5天限额公告.xlsx
+          path: 限额公告.xlsx
           if-no-files-found: ignore
-
       - name: 心跳保活 + 保存历史记录
         run: |
           git config user.name "github-actions[bot]"
@@ -56,5 +48,5 @@ jobs:
           date > .last-run
           git add .last-run seen_announcements.json || true
           git diff --cached --quiet || git commit -m "keepalive [skip ci]"
-          git pull --rebase origin main     # ★ 防止与你手动改代码时撞车
+          git pull --rebase origin main   # 防止与你手动改代码时撞车
           git push
