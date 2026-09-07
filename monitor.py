@@ -1,15 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-QDII 基金限额公告监控脚本 v3.4
+QDII 基金限额公告监控脚本 v3.5
 - 逐只打开天天基金公告页,抓取“过去2天 + 未来4天”窗口内的限额/限购相关公告
-- v3.3核心：不假设 table/ul/li DOM，通用抓取 <a> + 最近行容器解析日期
-- v3.4改动：
-  1) 时间窗口改为：今天往前2天 ~ 今天往后4天（含端点）
-  2) 降噪：优先限定在“公告列表区域”范围内找 <a>，并过滤明显非详情链接
-  3) 降噪：关键词改为“强匹配 + 排除项”
-  4) 降噪：未命中诊断标题最多打印 MAX_DIAG_TITLES 条
-- 与 seen_announcements.json 对比,新公告推送飞书
-- 推送成功后才更新已见记录(事务性,失败自动下轮重试)
+- 通用抓取：不假设 table/ul/li DOM，抓取公告列表区域内 <a>，从其“最近行容器”解析日期
+- 与 seen_announcements.json 对比去重，只推送新增；推送成功后才更新记录(事务性)
+- v3.5 优化点：
+  1) 降低 Page.goto 超时：分级 timeout + 指数退避重试
+  2) 提升加载速度/稳定性：拦截 image/font/media 资源请求
+  3) 翻页提前停止：若当前页“最早日期 < start_date”，停止继续翻页
+  4) 翻页按钮更稳：仅点击可见且非 disabled 的“下一页”
 """
 
 # ============================================================
@@ -39,10 +38,12 @@ LOG_FILE = APP_DIR / "fund_monitor.log"
 PAST_DAYS = 2
 FUTURE_DAYS = 4
 
-PAGE_TIMEOUT = 30000       # 单页加载超时(毫秒)
+# 基础超时/重试
+PAGE_TIMEOUT = 30000       # 单页导航基础超时(毫秒)；v3.5 会按 attempt 动态放大
+GOTO_TIMEOUTS = [30000, 60000, 90000]  # 第1/2/3次 goto 超时
 MAX_ATTEMPTS = 3           # 页面异常时最大尝试次数
-RETRY_WAIT_SECONDS = 2     # 重试前的等待秒数
-MAX_PAGES = 3              # 每只基金最多抓前几页公告(防公告太多翻页漏抓)
+RETRY_WAIT_SECONDS = 2     # 兜底等待(某些分支仍用)，主要退避逻辑见 backoff_sleep
+MAX_PAGES = 3              # 每只基金最多翻页数（仍保留硬上限，避免极端情况）
 TABLE_WAIT_TIMEOUT = 8000  # 等待公告列表骨架渲染的超时(毫秒)
 DEBUG_DIR = APP_DIR / "debug"   # 页面异常时的截图/HTML留证目录
 
@@ -338,13 +339,15 @@ def extract_raw_items(page):
 def parse_records_from_raw_items(raw_items, code, fund_name, source_url, start_date, end_date):
     """
     从 extract_raw_items 抓到的原始条目里，解析出：
-    - dated_item_count：窗口无关的、能解析出日期的条目总数（用于判断页面是否真的加载了公告数据）
+    - dated_item_count：能解析出日期的条目数（用于判定公告是否加载）
     - window_titles：落在日期窗口内的全部公告标题（无论是否命中关键词，用于诊断漏抓）
     - records：落在日期窗口内 且 命中限额关键词的公告（真正要推送/导出的）
+    - min_date_in_page：该页所有“可解析日期条目”的最早日期（用于翻页提前停止）
     """
     dated_item_count = 0
     window_titles = []
     records = []
+    min_date_in_page = None
 
     for item in raw_items:
         title = normalize_title(item.get("title", ""))
@@ -355,14 +358,13 @@ def parse_records_from_raw_items(raw_items, code, fund_name, source_url, start_d
             continue
 
         # 优先从整行文字找日期，找不到再退回标题本身
-        announcement_date = parse_date(row_text)
-        if announcement_date is None:
-            announcement_date = parse_date(title)
-
+        announcement_date = parse_date(row_text) or parse_date(title)
         if announcement_date is None:
             continue
 
         dated_item_count += 1
+        if (min_date_in_page is None) or (announcement_date < min_date_in_page):
+            min_date_in_page = announcement_date
 
         if not (start_date <= announcement_date <= end_date):
             continue
@@ -372,7 +374,9 @@ def parse_records_from_raw_items(raw_items, code, fund_name, source_url, start_d
         if not is_limit_title(title):
             continue
 
-        if href.startswith("/"):
+        if href.startswith("//"):
+            url = "https:" + href
+        elif href.startswith("/"):
             url = "https://fundf10.eastmoney.com" + href
         elif href.startswith("http"):
             url = href
@@ -387,7 +391,7 @@ def parse_records_from_raw_items(raw_items, code, fund_name, source_url, start_d
             "公告链接": url,
         })
 
-    return dated_item_count, window_titles, records
+    return dated_item_count, window_titles, records, min_date_in_page
 
 
 def save_debug_snapshot(page, code, tag):
@@ -402,6 +406,41 @@ def save_debug_snapshot(page, code, tag):
         pass
 
 
+def backoff_sleep(attempt_index_zero_based: int):
+    """指数退避 + 随机抖动（attempt=0/1/2 -> 约2/4/8秒）"""
+    base = 2 ** (attempt_index_zero_based + 1)
+    wait = base + random.uniform(0.0, 1.5)
+    time.sleep(wait)
+
+
+def find_clickable_next_button(page):
+    """
+    更稳健地找“下一页”：必须可见，并且 class/aria-disabled 不像 disabled。
+    返回 locator 或 None
+    """
+    candidates = page.locator("a", has_text="下一页")
+    try:
+        n = candidates.count()
+    except Exception:
+        return None
+
+    for i in range(n):
+        btn = candidates.nth(i)
+        try:
+            if not btn.is_visible():
+                continue
+            cls = (btn.get_attribute("class") or "").lower()
+            aria = (btn.get_attribute("aria-disabled") or "").lower()
+            if "disabled" in cls or "disable" in cls or "nobtn" in cls or "ban" in cls:
+                continue
+            if aria in ("true", "1"):
+                continue
+            return btn
+        except Exception:
+            continue
+    return None
+
+
 # ============================================================
 # 八、单只基金查询(通用抓取+重试+翻页+未命中诊断+失败留证)
 # ============================================================
@@ -410,53 +449,69 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
     source_url = f"https://fundf10.eastmoney.com/jjgg_{code}.html"
     logger.info("[%02d/%d] 正在查询：%s %s", index, total, code, fund_name)
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
+    for attempt in range(MAX_ATTEMPTS):
         try:
-            page.goto(source_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+            timeout = GOTO_TIMEOUTS[min(attempt, len(GOTO_TIMEOUTS) - 1)]
+            page.goto(source_url, wait_until="domcontentloaded", timeout=timeout)
 
-            # 等页面里出现<a>标签(尽力等待,超时不报错,后面还有dated_item_count判定兜底)
+            # 等页面里出现<a>标签(尽力等待,超时不报错,后面还有 dated_item_count 判定兜底)
             try:
                 page.wait_for_selector("a", state="attached", timeout=TABLE_WAIT_TIMEOUT)
             except Exception:
                 pass
-            page.wait_for_timeout(800)  # 出现<a>后给Ajax数据渲染留缓冲
+            page.wait_for_timeout(600)
 
             raw_items = extract_raw_items(page)
-            dated_item_count, window_titles, records = parse_records_from_raw_items(
+            dated_item_count, window_titles, records, min_date_in_page = parse_records_from_raw_items(
                 raw_items, code, fund_name, source_url, start_date, end_date
             )
 
-            # 公告数据是否真的加载了（不限定table还是ul/li结构）
+            # 公告数据是否真的加载了
             if dated_item_count == 0:
-                if attempt < MAX_ATTEMPTS:
-                    logger.info("  第%d次页面异常（未解析到任何带日期的公告条目），%d秒后重试...",
-                                attempt, RETRY_WAIT_SECONDS)
-                    time.sleep(RETRY_WAIT_SECONDS)
+                if attempt < MAX_ATTEMPTS - 1:
+                    logger.info("  第%d次页面异常（未解析到任何带日期的公告条目），退避后重试...",
+                                attempt + 1)
+                    backoff_sleep(attempt)
                     continue
                 save_debug_snapshot(page, code, "tablefail")
                 logger.info("没有找到额度相关公告：%s %s（连续%d次页面异常，已存debug截图）",
                             code, fund_name, MAX_ATTEMPTS)
                 return []
 
-            # 第1页正常:翻页继续抓(最多 MAX_PAGES 页,翻不动就停)
-            for _page_no in range(2, MAX_PAGES + 1):
-                try:
-                    next_btn = page.locator("a", has_text="下一页")
-                    if next_btn.count() == 0:
+            # 第1页正常：翻页继续抓（最多 MAX_PAGES 页；若该页最早日期 < start_date 则提前停止）
+            if (min_date_in_page is not None) and (min_date_in_page < start_date):
+                # 第一页已经早于窗口，说明窗口期公告很少/没有，不用翻
+                pass
+            else:
+                for _page_no in range(2, MAX_PAGES + 1):
+                    next_btn = find_clickable_next_button(page)
+                    if next_btn is None:
                         break
-                    next_btn.first.click()
-                    page.wait_for_timeout(1200)  # 翻页后等Ajax刷新
+
+                    try:
+                        next_btn.click()
+                    except Exception:
+                        break
+
+                    # 翻页后等 Ajax 刷新
+                    try:
+                        page.wait_for_selector("a", state="attached", timeout=TABLE_WAIT_TIMEOUT)
+                    except Exception:
+                        pass
+                    page.wait_for_timeout(900)
 
                     more_raw_items = extract_raw_items(page)
-                    _more_dated, more_window_titles, more_records = parse_records_from_raw_items(
+                    _more_dated, more_window_titles, more_records, more_min_date = parse_records_from_raw_items(
                         more_raw_items, code, fund_name, source_url, start_date, end_date
                     )
                     records.extend(more_records)
                     window_titles.extend(more_window_titles)
-                except Exception:
-                    break
 
-            # 翻页可能造成跨页重复,去重
+                    # 提前停止条件：这一页最早日期已经早于窗口起点
+                    if (more_min_date is not None) and (more_min_date < start_date):
+                        break
+
+            # 翻页可能造成跨页重复：去重
             unique, seen_keys = [], set()
             for r in records:
                 k = (r["基金代码"], r["公告日期"], r["公告标题"])
@@ -483,14 +538,17 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
                         logger.info("  ...窗口内未命中标题太多，仅展示前%d条", MAX_DIAG_TITLES)
                         break
                 logger.info("没有找到额度相关公告：%s %s", code, fund_name)
+
             return records
 
         except Exception as error:
-            if attempt < MAX_ATTEMPTS:
-                logger.info("  查询异常(%s)，%d秒后重试...", error, RETRY_WAIT_SECONDS)
-                time.sleep(RETRY_WAIT_SECONDS)
+            if attempt < MAX_ATTEMPTS - 1:
+                logger.info("  查询异常(%s)，退避后重试...", error)
+                backoff_sleep(attempt)
             else:
+                save_debug_snapshot(page, code, "gotofail")
                 logger.info("查询失败：%s %s", code, error)
+
     return []
 
 
@@ -504,7 +562,7 @@ def query_all_funds(page, fund_dict, start_date, end_date):
         all_records.extend(
             query_one_fund(page, idx, total, code, name, start_date, end_date)
         )
-        time.sleep(random.uniform(1.0, 2.0))  # 每只之间随机间隔,降低风控概率
+        time.sleep(random.uniform(0.8, 1.8))  # 每只之间随机间隔,降低风控概率
     return all_records
 
 
@@ -523,11 +581,32 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--disable-blink-features=AutomationControlled",
-                  "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-gpu",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
         )
         context = browser.new_context(user_agent=REQUEST_HEADERS["User-Agent"])
+
+        # v3.5：拦截不必要资源，提升加载速度/稳定性（对公告文本抓取通常足够）
+        def block_unneeded(route):
+            try:
+                r = route.request
+                if r.resource_type in ("image", "media", "font"):
+                    return route.abort()
+            except Exception:
+                pass
+            return route.continue_()
+
+        context.route("**/*", block_unneeded)
+
         page = context.new_page()
+        # 让 Playwright 的默认超时也更合理（可选）
+        page.set_default_timeout(30000)
+        page.set_default_navigation_timeout(90000)
+
         try:
             all_records = query_all_funds(page, fund_dict, start_date, end_date)
         finally:
