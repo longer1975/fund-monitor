@@ -2,15 +2,15 @@ name: fund-monitor
 
 on:
   schedule:
-    - cron: "7,17,27,37,47,57 * * * *"   # 每10分钟，避开整点高峰减少延迟
-  workflow_dispatch:                      # 手动运行按钮
+    - cron: "7,17,27,37,47,57 * * * *"   # 每10分钟，错峰避开整点高峰
+  workflow_dispatch:
 
 permissions:
-  contents: write                         # 允许把 seen json 提交回仓库
+  contents: write
 
 concurrency:
   group: fund-monitor
-  cancel-in-progress: false               # 上一次没跑完就等，避免git冲突
+  cancel-in-progress: false
 
 jobs:
   run:
@@ -18,10 +18,18 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                  # ★ 完整历史,保证 rebase/push 稳定
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: 缓存 Playwright 浏览器
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
       - name: 安装依赖
         run: |
@@ -46,6 +54,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           date > .last-run
-          git add .last-run seen_announcements.json
+          git add .last-run seen_announcements.json || true
           git diff --cached --quiet || git commit -m "keepalive [skip ci]"
+          git pull --rebase origin main     # ★ 防止与你手动改代码时撞车
           git push
