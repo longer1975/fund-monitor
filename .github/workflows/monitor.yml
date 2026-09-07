@@ -48,7 +48,13 @@ jobs:
 
           for attempt in 1 2 3; do
             git fetch origin main
-            python3 merge_seen.py
+
+            # 不依赖这次checkout本身是否已经包含merge_seen.py
+            # （如果这次运行触发时main还没有这个文件，本地checkout
+            #  就会停留在旧版本），直接从远端最新提交里取出脚本内容
+            # 执行，彻底避免"找不到文件"这类因checkout版本滞后导致的问题
+            git show origin/main:merge_seen.py > /tmp/merge_seen.py
+            python3 /tmp/merge_seen.py
 
             # 以远端最新提交为基准重置，避免任何历史分叉，
             # 再把合并好的结果写回工作区
