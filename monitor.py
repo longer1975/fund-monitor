@@ -1,16 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-QDII 基金限额公告监控脚本 v3.3
-- 逐只打开天天基金公告页,抓取近 N 天限额相关公告
-- ★ v3.3修复：v3.2 的"页面是否加载完成"判定和公告提取都严格依赖
-  <table><tr><td> 结构，但公告列表实际很可能是 <ul><li> 或其他容器，
-  导致 count_dated_rows() 永远为0、被误判为"页面没加载"，重试3次后
-  放弃，误报"没有找到公告"（银华、宝盈等基金实际有公告但抓不到就是这个原因）。
-  v3.3 改回不假设具体DOM结构的通用抓取：抓所有<a>标签，找其最近的
-  行容器(tr/li/其他)，从容器整体文字里解析日期，兼容各种页面结构。
-- 关键词采用宽覆盖子串匹配(兼容"限购/限大额/大额申购"等各种写法)
-- 支持翻页抓取(最多3页,防公告大户单页漏抓)
-- 未命中关键词时打印窗口内全部公告标题(诊断漏抓)
+QDII 基金限额公告监控脚本 v3.4
+- 逐只打开天天基金公告页,抓取“过去2天 + 未来4天”窗口内的限额/限购相关公告
+- v3.3核心：不假设 table/ul/li DOM，通用抓取 <a> + 最近行容器解析日期
+- v3.4改动：
+  1) 时间窗口改为：今天往前2天 ~ 今天往后4天（含端点）
+  2) 降噪：优先限定在“公告列表区域”范围内找 <a>，并过滤明显非详情链接
+  3) 降噪：关键词改为“强匹配 + 排除项”
+  4) 降噪：未命中诊断标题最多打印 MAX_DIAG_TITLES 条
 - 与 seen_announcements.json 对比,新公告推送飞书
 - 推送成功后才更新已见记录(事务性,失败自动下轮重试)
 """
@@ -25,6 +22,7 @@ import re
 import time
 import datetime
 import pathlib
+import logging
 
 import pandas as pd
 import requests
@@ -32,19 +30,23 @@ from playwright.sync_api import sync_playwright
 
 APP_DIR = pathlib.Path(__file__).resolve().parent
 
-FUND_LIST_CSV = APP_DIR / "fund_list.csv"          # 基金清单(可选,存在则优先)
-SEEN_RECORD_FILE = APP_DIR / "seen_announcements.json"  # 已推送记录(持久化到仓库)
-EXCEL_FILE = APP_DIR / "近5天限额公告.xlsx"
+FUND_LIST_CSV = APP_DIR / "fund_list.csv"                # 基金清单(可选,存在则优先)
+SEEN_RECORD_FILE = APP_DIR / "seen_announcements.json"   # 已推送记录(持久化到仓库)
+EXCEL_FILE = APP_DIR / "限额公告.xlsx"
 LOG_FILE = APP_DIR / "fund_monitor.log"
 
-RECENT_START_DATE = datetime.date(2026, 9, 2)  # 检查窗口固定从9月2日开始
-# 不再按“近N天”滚动，避免每天窗口变化导致重复/遗漏
+# 时间窗口：过去2天 + 未来4天（含端点）
+PAST_DAYS = 2
+FUTURE_DAYS = 4
+
 PAGE_TIMEOUT = 30000       # 单页加载超时(毫秒)
 MAX_ATTEMPTS = 3           # 页面异常时最大尝试次数
 RETRY_WAIT_SECONDS = 2     # 重试前的等待秒数
 MAX_PAGES = 3              # 每只基金最多抓前几页公告(防公告太多翻页漏抓)
 TABLE_WAIT_TIMEOUT = 8000  # 等待公告列表骨架渲染的超时(毫秒)
 DEBUG_DIR = APP_DIR / "debug"   # 页面异常时的截图/HTML留证目录
+
+MAX_DIAG_TITLES = 30       # 未命中关键词时，窗口内标题最多打印多少条（防日志爆）
 
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
 
@@ -55,19 +57,70 @@ REQUEST_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9",
 }
 
-# 限额公告关键词(子串匹配,命中任意一个即保留,覆盖各种写法)
-LIMIT_KEYWORDS = [
-    "限购", "限大额",
-    "大额申购", "限制申购", "申购限制",
-    "暂停申购", "恢复申购", "申购上限",
-    "单日申购", "单日累计",
-    "规模上限", "单日上限",
+# 更严格的“限额/限购”关键词（强匹配，减少误抓）
+LIMIT_KEYWORDS_STRICT = [
+    "限购", "限额", "限大额", "大额申购",
+    "暂停申购", "恢复申购",
+    "暂停大额申购", "恢复大额申购",
+    "申购上限", "单日上限", "规模上限",
+    "暂停定投", "暂停定期定额", "恢复定期定额",
+    "暂停转换转入", "恢复转换转入",
+]
+
+# 明确排除：这些通常不是“限额/限购”类
+EXCLUDE_KEYWORDS = [
+    "年度报告", "中期报告", "季度报告", "定期报告",
+    "招募说明书", "更新招募说明书", "基金合同", "托管协议",
+    "分红", "收益分配",
+    "净值", "临时公告",
+    "基金经理", "经理变更",
 ]
 
 
-def is_limit_title(title):
-    """判断公告标题是否限额相关(子串匹配,覆盖面比正则广)"""
-    return any(k in title for k in LIMIT_KEYWORDS)
+# ============================================================
+# 二、日志(同时输出到控制台和文件)
+# ============================================================
+logger = logging.getLogger("fund_monitor")
+logger.setLevel(logging.INFO)
+_fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+_sh = logging.StreamHandler()
+_sh.setFormatter(_fmt)
+logger.addHandler(_sh)
+try:
+    _fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    _fh.setFormatter(_fmt)
+    logger.addHandler(_fh)
+except Exception:
+    pass
+
+
+# ============================================================
+# 三、基金清单加载
+# ============================================================
+def load_fund_dict():
+    """优先读 fund_list.csv(代码,名称);不存在则用脚本内置完整列表"""
+    if FUND_LIST_CSV.exists():
+        try:
+            df = pd.read_csv(FUND_LIST_CSV, dtype=str)
+            df.columns = [str(c).strip() for c in df.columns]
+            code_col = next((c for c in df.columns
+                             if c in ("代码", "code", "基金代码")), df.columns[0])
+            name_col = next((c for c in df.columns
+                             if c in ("名称", "name", "基金名称", "简称")), df.columns[1])
+            fund_dict = {}
+            for _, row in df.iterrows():
+                code = str(row[code_col]).strip().split(".")[0].zfill(6)
+                name = str(row[name_col]).strip()
+                if code and code != "nan":
+                    fund_dict[code] = name
+            logger.info("已从 %s 读取 %d 只基金", FUND_LIST_CSV.name, len(fund_dict))
+            return fund_dict
+        except Exception as e:
+            logger.info("读取基金列表失败(%s),改用脚本内置列表", e)
+    else:
+        logger.info("未找到 %s,使用脚本内置列表(%d只)",
+                    FUND_LIST_CSV.name, len(FALLBACK_FUND_DICT))
+    return dict(FALLBACK_FUND_DICT)
 
 
 # ★ 完整基金列表(53只)——仅当仓库里不存在 fund_list.csv 时使用
@@ -130,60 +183,16 @@ FALLBACK_FUND_DICT = {
     "096001": "大成标普500等权重指数",
 }
 
-# ============================================================
-# 二、日志(同时输出到控制台和文件)
-# ============================================================
-import logging
-
-logger = logging.getLogger("fund_monitor")
-logger.setLevel(logging.INFO)
-_fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-_sh = logging.StreamHandler()
-_sh.setFormatter(_fmt)
-logger.addHandler(_sh)
-try:
-    _fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
-    _fh.setFormatter(_fmt)
-    logger.addHandler(_fh)
-except Exception:
-    pass
-
-
-# ============================================================
-# 三、基金清单加载
-# ============================================================
-def load_fund_dict():
-    """优先读 fund_list.csv(代码,名称);不存在则用脚本内置完整列表"""
-    if FUND_LIST_CSV.exists():
-        try:
-            df = pd.read_csv(FUND_LIST_CSV, dtype=str)
-            df.columns = [str(c).strip() for c in df.columns]
-            code_col = next((c for c in df.columns
-                             if c in ("代码", "code", "基金代码")), df.columns[0])
-            name_col = next((c for c in df.columns
-                             if c in ("名称", "name", "基金名称", "简称")), df.columns[1])
-            fund_dict = {}
-            for _, row in df.iterrows():
-                code = str(row[code_col]).strip().split(".")[0].zfill(6)
-                name = str(row[name_col]).strip()
-                if code and code != "nan":
-                    fund_dict[code] = name
-            logger.info("已从 %s 读取 %d 只基金", FUND_LIST_CSV.name, len(fund_dict))
-            return fund_dict
-        except Exception as e:
-            logger.info("读取基金列表失败(%s),改用脚本内置列表", e)
-    else:
-        logger.info("未找到 %s,使用脚本内置列表(%d只)",
-                    FUND_LIST_CSV.name, len(FALLBACK_FUND_DICT))
-    return dict(FALLBACK_FUND_DICT)
-
 
 # ============================================================
 # 四、日期窗口 + 文字/日期处理
 # ============================================================
-def fetch_recent_start_date():
-    """返回固定的公告检查起始日期"""
-    return RECENT_START_DATE
+def fetch_window_dates(past_days, future_days):
+    """返回窗口日期：[今天- past_days, 今天+ future_days]（含端点）"""
+    today = datetime.date.today()
+    start_date = today - datetime.timedelta(days=past_days)
+    end_date = today + datetime.timedelta(days=future_days)
+    return start_date, end_date
 
 
 def clean_text(value):
@@ -207,9 +216,6 @@ def parse_date(text):
     """
     从文字中提取日期，兼容多种写法：
     2026-08-29 / 2026/08/29 / 2026.08.29 / 2026年08月29日
-    ★ v3.3：不再假设日期一定单独出现在某个固定的<td>里，
-    而是从任意一段文字（标题、整行文字）里用正则找日期，
-    这样无论页面用table还是ul/li排版都能兼容。
     """
     text = clean_text(text)
     match = re.search(r"(20\d{2})[-年/.](\d{1,2})[-月/.](\d{1,2})", text)
@@ -228,6 +234,14 @@ def format_date(value):
     if isinstance(value, (datetime.datetime, datetime.date)):
         return value.strftime("%Y-%m-%d")
     return str(value)
+
+
+def is_limit_title(title):
+    """判断公告标题是否限额相关（强匹配 + 排除项）"""
+    t = normalize_title(title)
+    if any(x in t for x in EXCLUDE_KEYWORDS):
+        return False
+    return any(k in t for k in LIMIT_KEYWORDS_STRICT)
 
 
 # ============================================================
@@ -274,34 +288,41 @@ def send_feishu(new_records):
 # ============================================================
 def extract_raw_items(page):
     """
-    通用抓取：只找页面里所有<a>标签，连同它所在的行/列表项容器
-    (tr、li、常见公告容器class、或直接父元素)一起返回原始文字，
-    不对页面具体是table还是ul/li做任何假设。
-
-    ★ v3.3核心修复点：v3.2 只认<table><tr><td>结构，
-    如果公告列表实际是<ul><li>或其他容器就会一条都抓不到。
+    通用抓取：尽量限定在“公告列表区域”内找 <a>，找不到再退回整页；
+    同时过滤明显不是详情链接的 href（# / javascript: / 空）
     """
     try:
         raw_items = page.evaluate(
             r"""
             () => {
                 const result = [];
-                const links = Array.from(document.querySelectorAll("a"));
+
                 const clean = (value) => {
                     return String(value || "")
                         .replace(/[\s\u3000]+/g, "")
                         .trim();
                 };
+
+                // 尽量把范围限定在“公告列表”附近（不同基金页结构不一）
+                const scope =
+                    document.querySelector("#jjgg, .jjgg, .fundNoticeList, #gg, .gg, .txt_in")
+                    || document;
+
+                const links = Array.from(scope.querySelectorAll("a"));
+
                 for (const link of links) {
                     const title = clean(link.innerText || link.textContent);
                     if (!title) continue;
-                    let row = link.closest("tr");
-                    if (!row) row = link.closest("li");
-                    if (!row) row = link.closest(".list-item, .notice-item, .item, .box, .jjgg, .fundNoticeList");
+
+                    const href = (link.getAttribute("href") || "").trim();
+                    if (!href || href === "#" || href.toLowerCase().startsWith("javascript:")) continue;
+
+                    let row = link.closest("tr") || link.closest("li");
+                    if (!row) row = link.closest(".list-item, .notice-item, .item, .box");
                     if (!row) row = link.parentElement;
                     if (!row) row = link;
+
                     const rowText = clean(row.innerText || row.textContent);
-                    const href = link.getAttribute("href") || "";
                     result.push({ title: title, rowText: rowText, href: href });
                 }
                 return result;
@@ -341,8 +362,6 @@ def parse_records_from_raw_items(raw_items, code, fund_name, source_url, start_d
         if announcement_date is None:
             continue
 
-        # 只要能解析出日期，就算作"页面确实加载出了公告数据"的证据，
-        # 不管这条公告是否落在时间窗口内、是否命中关键词
         dated_item_count += 1
 
         if not (start_date <= announcement_date <= end_date):
@@ -407,7 +426,7 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
                 raw_items, code, fund_name, source_url, start_date, end_date
             )
 
-            # ★ 核心判定:公告数据是否真的加载了（不限定table还是ul/li结构）
+            # 公告数据是否真的加载了（不限定table还是ul/li结构）
             if dated_item_count == 0:
                 if attempt < MAX_ATTEMPTS:
                     logger.info("  第%d次页面异常（未解析到任何带日期的公告条目），%d秒后重试...",
@@ -435,7 +454,7 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
                     records.extend(more_records)
                     window_titles.extend(more_window_titles)
                 except Exception:
-                    break  # 翻页失败静默停止,不影响已抓到的
+                    break
 
             # 翻页可能造成跨页重复,去重
             unique, seen_keys = [], set()
@@ -451,13 +470,18 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
                 for r in records:
                     logger.info("- %s %s", r["公告日期"], r["公告标题"])
             else:
-                # 有日期条目但没命中关键词 = 打出窗口内全部标题,便于诊断
+                # 有日期条目但没命中关键词：打印窗口内部分标题用于诊断（限量）
                 shown = set()
+                printed = 0
                 for d, t in window_titles:
                     if (d, t) in shown:
                         continue
                     shown.add((d, t))
                     logger.info("  窗口内公告(未命中关键词)：%s %s", d, t)
+                    printed += 1
+                    if printed >= MAX_DIAG_TITLES:
+                        logger.info("  ...窗口内未命中标题太多，仅展示前%d条", MAX_DIAG_TITLES)
+                        break
                 logger.info("没有找到额度相关公告：%s %s", code, fund_name)
             return records
 
@@ -488,9 +512,9 @@ def query_all_funds(page, fund_dict, start_date, end_date):
 # 十、主流程
 # ============================================================
 def main():
-    start_date = fetch_recent_start_date()
-    end_date = datetime.date.today()
-    logger.info("本次检查窗口：%s ~ %s（历史日期固定从9月2日开始）", start_date, end_date)
+    start_date, end_date = fetch_window_dates(PAST_DAYS, FUTURE_DAYS)
+    logger.info("本次检查窗口：%s ~ %s（过去%d天 + 未来%d天）",
+                start_date, end_date, PAST_DAYS, FUTURE_DAYS)
 
     fund_dict = load_fund_dict()
     seen = load_seen_records()
@@ -536,7 +560,7 @@ def main():
         logger.info("推送失败(%s),记录不更新,下轮自动重试", e)
         return
 
-    # ★ 只有推送成功才写记录(事务性)
+    # 只有推送成功才写记录(事务性)
     seen.update(r["_key"] for r in new_records)
     save_seen_records(seen)
 
