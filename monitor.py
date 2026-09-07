@@ -88,4 +88,347 @@ FALLBACK_FUND_DICT = {
     "457001": "国富亚洲机会",
     "100055": "富国全球科技互联",
     "006555": "浦银全球智能科技",
- 
+    "001668": "汇添富全球移动互联",
+    "017144": "华宝海外新能源汽车",
+    # ---- 纳斯达克100系(16只)----
+    "160213": "国泰纳斯达克100指数",
+    "016055": "博时纳斯达克100ETF联接",
+    "040046": "华安纳斯达克100ETF联接",
+    "019172": "摩根纳斯达克100指数",
+    "019441": "万家纳斯达克100指数",
+    "018043": "天弘纳斯达克100指数",
+    "016532": "嘉实纳斯达克100ETF联接",
+    "019547": "招商纳斯达克100ETF联接",
+    "000834": "大成纳斯达克100ETF联接",
+    "015299": "华夏纳斯达克100ETF联接",
+    "161130": "易方达纳斯达克100ETF联接",
+    "019736": "宝盈纳斯达克100指数",
+    "016452": "南方纳斯达克100指数",
+    "539001": "建信纳斯达克100指数",
+    "019524": "华泰柏瑞纳斯达克100ETF联接",
+    "018966": "汇添富纳斯达克100ETF联接",
+    # ---- 标普系(8只)----
+    "017641": "摩根标普500指数(QDII)",
+    "050025": "博时标普500ETF联接A",
+    "519981": "长信标普100",
+    "161125": "易方达标普500指数人民币",
+    "017028": "国泰标普500ETF发起联接",
+    "007721": "天弘标普500发起(QDII)",
+    "018064": "华夏标普500ETF发起式",
+    "096001": "大成标普500等权重指数",
+}
+
+# ============================================================
+# 二、日志(同时输出到控制台和文件)
+# ============================================================
+import logging
+
+logger = logging.getLogger("fund_monitor")
+logger.setLevel(logging.INFO)
+_fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+_sh = logging.StreamHandler()
+_sh.setFormatter(_fmt)
+logger.addHandler(_sh)
+try:
+    _fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    _fh.setFormatter(_fmt)
+    logger.addHandler(_fh)
+except Exception:
+    pass
+
+
+# ============================================================
+# 三、基金清单加载
+# ============================================================
+def load_fund_dict():
+    """优先读 fund_list.csv(代码,名称);不存在则用脚本内置完整列表"""
+    if FUND_LIST_CSV.exists():
+        try:
+            df = pd.read_csv(FUND_LIST_CSV, dtype=str)
+            df.columns = [str(c).strip() for c in df.columns]
+            code_col = next((c for c in df.columns
+                             if c in ("代码", "code", "基金代码")), df.columns[0])
+            name_col = next((c for c in df.columns
+                             if c in ("名称", "name", "基金名称", "简称")), df.columns[1])
+            fund_dict = {}
+            for _, row in df.iterrows():
+                code = str(row[code_col]).strip().split(".")[0].zfill(6)
+                name = str(row[name_col]).strip()
+                if code and code != "nan":
+                    fund_dict[code] = name
+            logger.info("已从 %s 读取 %d 只基金", FUND_LIST_CSV.name, len(fund_dict))
+            return fund_dict
+        except Exception as e:
+            logger.info("读取基金列表失败(%s),改用脚本内置列表", e)
+    else:
+        logger.info("未找到 %s,使用脚本内置列表(%d只)",
+                    FUND_LIST_CSV.name, len(FALLBACK_FUND_DICT))
+    return dict(FALLBACK_FUND_DICT)
+
+
+# ============================================================
+# 四、日期窗口
+# ============================================================
+def fetch_recent_start_date(recent_days):
+    """返回起始日期(含今天往前推 recent_days 天)"""
+    return datetime.date.today() - datetime.timedelta(days=recent_days - 1)
+
+
+# ============================================================
+# 五、已见记录读写
+# ============================================================
+def load_seen_records():
+    if SEEN_RECORD_FILE.exists():
+        try:
+            with open(SEEN_RECORD_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return set(data) if isinstance(data, list) else set()
+        except Exception as e:
+            logger.info("读取已见记录失败(%s),按空记录处理", e)
+    return set()
+
+
+def save_seen_records(seen_set):
+    with open(SEEN_RECORD_FILE, "w", encoding="utf-8") as f:
+        json.dump(sorted(seen_set), f, ensure_ascii=False, indent=2)
+
+
+# ============================================================
+# 六、飞书推送(文本消息)
+# ============================================================
+def send_feishu(new_records):
+    if not FEISHU_WEBHOOK_URL:
+        logger.info("未配置飞书 Webhook,跳过推送")
+        return
+    new_count = len(new_records)
+    lines = [f"发现新的限额公告：{new_count}条"]
+    for r in new_records:
+        lines.append(f"- {r['基金代码']} {r['公告日期']} {r['公告标题']}")
+        lines.append(f"  {r['公告链接']}")
+    payload = {"msg_type": "text", "content": {"text": "\n".join(lines)}}
+    resp = requests.post(FEISHU_WEBHOOK_URL, json=payload, timeout=10)
+    if resp.status_code == 200:
+        logger.info("飞书消息发送成功")
+    else:
+        raise RuntimeError(f"飞书发送失败:{resp.status_code} {resp.text}")
+
+
+# ============================================================
+# 七、页面公告提取 + 页面状态判定
+# ============================================================
+def extract_page_records(*, page, code, fund_name, source_url, start_date, end_date):
+    rows = page.locator("table tr")
+    row_count = rows.count()
+    records = []
+    for i in range(row_count):
+        try:
+            cells = rows.nth(i).locator("td")
+            if cells.count() < 2:
+                continue
+            date_text = cells.nth(0).inner_text().strip()
+            try:
+                row_date = datetime.datetime.strptime(date_text, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if not (start_date <= row_date <= end_date):
+                continue
+            link = rows.nth(i).locator("a").first
+            if link.count() == 0:
+                continue
+            title = link.inner_text().strip()
+            if not title:
+                continue
+            if not any(p.search(title) for p in KEYWORD_PATTERNS):
+                continue
+            href = link.get_attribute("href") or ""
+            if href.startswith("/"):
+                url = "https://fundf10.eastmoney.com" + href
+            elif href.startswith("http"):
+                url = href
+            else:
+                url = source_url
+            records.append({
+                "基金代码": code,
+                "基金名称": fund_name,
+                "公告日期": date_text,
+                "公告标题": title,
+                "公告链接": url,
+            })
+        except Exception:
+            continue
+    return records
+
+
+def count_dated_rows(page):
+    """统计页面上带 yyyy-mm-dd 日期的表格单元格数。
+    公告数据由Ajax加载——日期行存在=数据真的到了;日期行为0=表格没加载出来。"""
+    try:
+        texts = page.locator("table td").all_inner_texts()
+    except Exception:
+        return 0
+    return sum(1 for t in texts if t and re.search(r"\d{4}-\d{2}-\d{2}", t))
+
+
+def save_debug_snapshot(page, code, tag):
+    """页面异常时保存截图和HTML,便于排查"""
+    try:
+        DEBUG_DIR.mkdir(exist_ok=True)
+        ts = datetime.datetime.now().strftime("%H%M%S")
+        page.screenshot(path=str(DEBUG_DIR / f"{code}_{tag}_{ts}.png"), full_page=False)
+        with open(DEBUG_DIR / f"{code}_{tag}_{ts}.html", "w", encoding="utf-8") as f:
+            f.write(page.content())
+    except Exception:
+        pass
+
+
+# ============================================================
+# 八、单只基金查询(v3.1:日期行判定+表格等待+翻页+失败留证)
+# ============================================================
+def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
+    code = str(code).zfill(6)
+    source_url = f"https://fundf10.eastmoney.com/jjgg_{code}.html"
+    logger.info("[%02d/%d] 正在查询：%s %s", index, total, code, fund_name)
+
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            page.goto(source_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+
+            # 等公告表格骨架出现(尽力等待,超时不报错,后面还有日期行判定兜底)
+            try:
+                page.wait_for_selector("table tr", state="attached",
+                                       timeout=TABLE_WAIT_TIMEOUT)
+            except Exception:
+                pass
+            page.wait_for_timeout(800)  # 表格出现后给数据渲染留缓冲
+
+            records = extract_page_records(
+                page=page, code=code, fund_name=fund_name,
+                source_url=source_url, start_date=start_date, end_date=end_date,
+            )
+
+            # ★ 核心判定:公告数据是否真的加载了
+            dated_rows = count_dated_rows(page)
+            if dated_rows == 0:
+                # 页面外壳有了但公告数据没到 = 页面异常,重试
+                if attempt < MAX_ATTEMPTS:
+                    logger.info("  第%d次页面异常（公告表格未加载，日期行0条），%d秒后重试...",
+                                attempt, RETRY_WAIT_SECONDS)
+                    time.sleep(RETRY_WAIT_SECONDS)
+                    continue
+                save_debug_snapshot(page, code, "tablefail")
+                logger.info("没有找到额度相关公告：%s %s（连续%d次页面异常，已存debug截图）",
+                            code, fund_name, MAX_ATTEMPTS)
+                return []
+
+            # 第1页正常:翻页继续抓(最多 MAX_PAGES 页,翻不动就停)
+            for _page_no in range(2, MAX_PAGES + 1):
+                try:
+                    next_btn = page.locator("a", has_text="下一页")
+                    if next_btn.count() == 0:
+                        break
+                    next_btn.first.click()
+                    page.wait_for_timeout(1200)  # 翻页后等Ajax刷新
+                    records.extend(extract_page_records(
+                        page=page, code=code, fund_name=fund_name,
+                        source_url=source_url,
+                        start_date=start_date, end_date=end_date,
+                    ))
+                except Exception:
+                    break  # 翻页失败静默停止,不影响已抓到的
+
+            # 翻页可能造成跨页重复,去重
+            unique, seen_keys = [], set()
+            for r in records:
+                k = (r["基金代码"], r["公告日期"], r["公告标题"])
+                if k not in seen_keys:
+                    seen_keys.add(k)
+                    unique.append(r)
+            records = unique
+
+            if records:
+                logger.info("找到额度相关公告：%s %s", code, fund_name)
+                for r in records:
+                    logger.info("- %s %s", r["公告日期"], r["公告标题"])
+            else:
+                # 有日期行但没匹配公告 = 真没有
+                logger.info("没有找到额度相关公告：%s %s", code, fund_name)
+            return records
+
+        except Exception as error:
+            if attempt < MAX_ATTEMPTS:
+                logger.info("  查询异常(%s)，%d秒后重试...", error, RETRY_WAIT_SECONDS)
+                time.sleep(RETRY_WAIT_SECONDS)
+            else:
+                logger.info("查询失败：%s %s", code, error)
+    return []
+
+
+# ============================================================
+# 九、全量查询
+# ============================================================
+def query_all_funds(page, fund_dict, start_date, end_date):
+    total = len(fund_dict)
+    all_records = []
+    for idx, (code, name) in enumerate(fund_dict.items(), start=1):
+        all_records.extend(
+            query_one_fund(page, idx, total, code, name, start_date, end_date)
+        )
+        time.sleep(random.uniform(1.0, 2.0))  # 每只之间随机间隔,降低风控概率
+    return all_records
+
+
+# ============================================================
+# 十、主流程
+# ============================================================
+def main():
+    start_date = fetch_recent_start_date(RECENT_DAYS)
+    end_date = datetime.date.today()
+    logger.info("本次检查窗口：%s ~ %s", start_date, end_date)
+
+    fund_dict = load_fund_dict()
+    seen = load_seen_records()
+
+    all_records = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(user_agent=REQUEST_HEADERS["User-Agent"])
+        page = context.new_page()
+        try:
+            all_records = query_all_funds(page, fund_dict, start_date, end_date)
+        finally:
+            browser.close()
+
+    # 保存 Excel(无论是否有公告都生成,便于 artifact 查看全量)
+    df = pd.DataFrame(all_records, columns=["基金代码", "基金名称", "公告日期", "公告标题", "公告链接"])
+    df.to_excel(EXCEL_FILE, index=False)
+    logger.info("Excel已保存：%s", EXCEL_FILE)
+
+    # 对比已见记录,筛出新公告
+    new_records = []
+    for r in all_records:
+        key = f"{r['基金代码']}|{r['公告日期']}|{r['公告标题']}"
+        if key not in seen:
+            r["_key"] = key
+            new_records.append(r)
+
+    if not new_records:
+        logger.info("本轮没有新的限额公告")
+        return
+
+    logger.info("发现新的限额公告：%d条", len(new_records))
+    for r in new_records:
+        logger.info("- %s %s %s", r["基金代码"], r["公告日期"], r["公告标题"])
+
+    try:
+        send_feishu(new_records)
+    except Exception as e:
+        logger.info("推送失败(%s),记录不更新,下轮自动重试", e)
+        return
+
+    # ★ 只有推送成功才写记录(事务性)
+    seen.update(r["_key"] for r in new_records)
+    save_seen_records(seen)
+
+
+if __name__ == "__main__":
+    main()
