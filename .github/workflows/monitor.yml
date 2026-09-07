@@ -1,0 +1,51 @@
+name: fund-monitor
+
+on:
+  schedule:
+    - cron: "7,17,27,37,47,57 * * * *"   # 每10分钟，避开整点高峰减少延迟
+  workflow_dispatch:                      # 手动运行按钮
+
+permissions:
+  contents: write                         # 允许把 seen json 提交回仓库
+
+concurrency:
+  group: fund-monitor
+  cancel-in-progress: false               # 上一次没跑完就等，避免git冲突
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: 运行监控
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        run: python monitor.py
+
+      - name: 上传Excel
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: excel
+          path: 近5天限额公告.xlsx
+          if-no-files-found: ignore
+
+      - name: 心跳保活 + 保存历史记录
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          date > .last-run
+          git add .last-run seen_announcements.json
+          git diff --cached --quiet || git commit -m "keepalive [skip ci]"
+          git push
