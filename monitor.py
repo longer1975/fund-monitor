@@ -2,10 +2,11 @@
 """
 基金限额公告监控（GitHub Actions 单轮模式版）
 由 workflow 每10分钟触发一次，每次只执行一轮查询
+v2：增加页面加载智能等待、抓取重试机制、基金间隔延迟，修复偶发漏抓
 """
 
 import json
-import os          # ★ 修改点1：新增 os 导入（用于读取环境变量）
+import os
 import re
 import time
 from copy import copy
@@ -90,8 +91,15 @@ ALLOW_FUTURE_DAYS = 4
 # 页面最长等待时间，单位：毫秒
 PAGE_TIMEOUT = 6000
 
-# 页面加载完成后等待动态内容，单位：毫秒
-WAIT_AFTER_LOAD = 300
+# ★ v2修复：页面加载完成后等待动态内容，从300毫秒提高到1500毫秒
+#   东财公告列表是 Ajax 动态注入，300毫秒经常等不到公告渲染完成
+WAIT_AFTER_LOAD = 1500
+
+# 单只基金最大尝试次数（抓取失败自动重试）
+MAX_ATTEMPTS = 3
+
+# 重试间隔，单位：秒
+RETRY_WAIT_SECONDS = 2
 
 # 是否后台运行
 HEADLESS = True
@@ -110,8 +118,8 @@ EXCEL_FILE = "近5天限额公告.xlsx"
 
 # ============================================================
 # 三、飞书配置
-# ★ 修改点1：webhook 改为从环境变量读取，绝不硬编码到代码里
-#   （GitHub 仓库代码公开可见，Secrets 才是安全存放位置）
+# webhook 从环境变量读取，不硬编码到代码里
+# （GitHub 仓库代码公开可见，Secrets 才是安全存放位置）
 # ============================================================
 
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
@@ -254,7 +262,7 @@ def block_unnecessary_resources(route):
 def extract_page_records(page, code, fund_name, source_url, start_date, end_date):
     """快速提取公告：标题只读a标签本身，日期从最近公告行读取"""
     try:
-        # 注意：使用 r""" 原始字符串，保证正则原样传给 JS
+        # 使用 r""" 原始字符串，保证正则原样传给 JS
         raw_items = page.evaluate(
             r"""
             () => {
@@ -326,40 +334,63 @@ def extract_page_records(page, code, fund_name, source_url, start_date, end_date
 
 # ============================================================
 # 九、查询单只基金
+# ★ v2修复：带重试机制。页面没加载完或被风控导致抓取失败时，
+#   自动重试最多 MAX_ATTEMPTS 次，而不是静默当"没有公告"
 # ============================================================
 
 def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
-    """查询一只基金"""
+    """查询一只基金（带重试机制）"""
     code = str(code).zfill(6)
     source_url = f"https://fundf10.eastmoney.com/jjgg_{code}.html"
 
     print(f"[{index:02d}/{total}] 正在查询：{code} {fund_name}")
 
-    try:
-        page.goto(source_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
-        page.wait_for_timeout(WAIT_AFTER_LOAD)
+    records = []
 
-        records = extract_page_records(
-            page=page, code=code, fund_name=fund_name,
-            source_url=source_url, start_date=start_date, end_date=end_date,
-        )
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            page.goto(source_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
 
-        if records:
-            print(f"找到额度相关公告：{code} {fund_name}")
-            for record in records:
-                print(f"- {record['公告日期']} {record['公告标题']}")
-        else:
-            print(f"没有找到额度相关公告：{code} {fund_name}")
+            # 智能等待：等页面 a 标签出现（最多再等3秒）
+            try:
+                page.wait_for_selector("a", state="attached", timeout=3000)
+            except Exception:
+                pass
 
-        return records
+            # 额外固定等待，让 Ajax 有时间注入公告列表
+            page.wait_for_timeout(WAIT_AFTER_LOAD)
 
-    except Exception as error:
-        print(f"查询失败：{code} {error}")
-        return []
+            records = extract_page_records(
+                page=page, code=code, fund_name=fund_name,
+                source_url=source_url, start_date=start_date, end_date=end_date,
+            )
+
+            if records:
+                print(f"找到额度相关公告：{code} {fund_name}")
+                for record in records:
+                    print(f"- {record['公告日期']} {record['公告标题']}")
+                return records
+
+            # 没抓到 → 重试
+            if attempt < MAX_ATTEMPTS:
+                print(f"  第{attempt}次未抓到，{RETRY_WAIT_SECONDS}秒后重试...")
+                time.sleep(RETRY_WAIT_SECONDS)
+            else:
+                print(f"没有找到额度相关公告：{code} {fund_name}")
+
+        except Exception as error:
+            if attempt < MAX_ATTEMPTS:
+                print(f"  查询异常({error})，{RETRY_WAIT_SECONDS}秒后重试...")
+                time.sleep(RETRY_WAIT_SECONDS)
+            else:
+                print(f"查询失败：{code} {error}")
+
+    return records
 
 
 # ============================================================
 # 十、查询全部基金
+# ★ v2修复：基金之间加随机延迟，降低被东财风控的概率
 # ============================================================
 
 def query_all_funds(browser):
@@ -398,6 +429,8 @@ def query_all_funds(browser):
                 fund_name=fund_name, start_date=start_date, end_date=end_date,
             )
             results.extend(records)
+            # 基金之间随机延迟 0.8~1.2 秒，模拟人工浏览节奏
+            time.sleep(0.8 + (index % 3) * 0.2)
     finally:
         try:
             page.close()
@@ -596,9 +629,8 @@ def run_one_round(browser, seen_records, first_run):
 
 # ============================================================
 # 十五、主程序
-# ★ 修改点2：删除 while True + time.sleep 循环
-#   GitHub Actions 的 cron 定时器负责每10分钟触发一次，
-#   每次运行只执行一轮，跑完即退出
+# 单轮模式：GitHub Actions 的 cron 定时器负责每10分钟触发一次，
+# 每次运行只执行一轮，跑完即退出
 # ============================================================
 
 def main():
@@ -606,11 +638,12 @@ def main():
     first_run = not os.path.exists(SEEN_FILE)
 
     print("=" * 80)
-    print("基金限额公告监控（单轮模式，由 GitHub Actions 定时触发）")
+    print("基金限额公告监控（单轮模式 + 重试机制，由 GitHub Actions 定时触发）")
     print("=" * 80)
     print(f"基金数量：{len(fund_dict)}只")
     print(f"查询范围：最近{RECENT_DAYS}个自然日")
     print(f"未来日期容许：{ALLOW_FUTURE_DAYS}天")
+    print(f"单基金最大尝试：{MAX_ATTEMPTS}次")
     print(f"历史公告数量：{len(seen_records)}条")
     print(f"是否首次运行：{first_run}")
     print("=" * 80)
