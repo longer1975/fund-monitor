@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-QDII 基金限额公告监控脚本 v3.2
+QDII 基金限额公告监控脚本 v3.3
 - 逐只打开天天基金公告页,抓取近 N 天限额相关公告
-- 页面正常判据:表格里存在带日期的数据行(根治AJAX慢加载误判)
+- ★ v3.3修复：v3.2 的"页面是否加载完成"判定和公告提取都严格依赖
+  <table><tr><td> 结构，但公告列表实际很可能是 <ul><li> 或其他容器，
+  导致 count_dated_rows() 永远为0、被误判为"页面没加载"，重试3次后
+  放弃，误报"没有找到公告"（银华、宝盈等基金实际有公告但抓不到就是这个原因）。
+  v3.3 改回不假设具体DOM结构的通用抓取：抓所有<a>标签，找其最近的
+  行容器(tr/li/其他)，从容器整体文字里解析日期，兼容各种页面结构。
 - 关键词采用宽覆盖子串匹配(兼容"限购/限大额/大额申购"等各种写法)
 - 支持翻页抓取(最多3页,防公告大户单页漏抓)
 - 未命中关键词时打印窗口内全部公告标题(诊断漏抓)
@@ -37,7 +42,7 @@ PAGE_TIMEOUT = 30000       # 单页加载超时(毫秒)
 MAX_ATTEMPTS = 3           # 页面异常时最大尝试次数
 RETRY_WAIT_SECONDS = 2     # 重试前的等待秒数
 MAX_PAGES = 3              # 每只基金最多抓前几页公告(防公告太多翻页漏抓)
-TABLE_WAIT_TIMEOUT = 8000  # 等待公告表格骨架渲染的超时(毫秒)
+TABLE_WAIT_TIMEOUT = 8000  # 等待公告列表骨架渲染的超时(毫秒)
 DEBUG_DIR = APP_DIR / "debug"   # 页面异常时的截图/HTML留证目录
 
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
@@ -174,11 +179,55 @@ def load_fund_dict():
 
 
 # ============================================================
-# 四、日期窗口
+# 四、日期窗口 + 文字/日期处理
 # ============================================================
 def fetch_recent_start_date(recent_days):
     """返回起始日期(含今天往前推 recent_days 天)"""
     return datetime.date.today() - datetime.timedelta(days=recent_days - 1)
+
+
+def clean_text(value):
+    """清理网页文字"""
+    if value is None:
+        return ""
+    text = str(value)
+    text = text.replace("\n", "").replace("\r", "").replace("\t", "")
+    text = text.replace(" ", "").replace("　", "")
+    return text.strip()
+
+
+def normalize_title(title):
+    """统一公告标题格式"""
+    title = clean_text(title)
+    title = title.replace("（", "(").replace("）", ")")
+    return title
+
+
+def parse_date(text):
+    """
+    从文字中提取日期，兼容多种写法：
+    2026-08-29 / 2026/08/29 / 2026.08.29 / 2026年08月29日
+    ★ v3.3：不再假设日期一定单独出现在某个固定的<td>里，
+    而是从任意一段文字（标题、整行文字）里用正则找日期，
+    这样无论页面用table还是ul/li排版都能兼容。
+    """
+    text = clean_text(text)
+    match = re.search(r"(20\d{2})[-年/.](\d{1,2})[-月/.](\d{1,2})", text)
+    if not match:
+        return None
+    try:
+        return datetime.date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
+
+
+def format_date(value):
+    """格式化日期为 YYYY-MM-DD"""
+    if value is None:
+        return ""
+    if isinstance(value, (datetime.datetime, datetime.date)):
+        return value.strftime("%Y-%m-%d")
+    return str(value)
 
 
 # ============================================================
@@ -221,83 +270,105 @@ def send_feishu(new_records):
 
 
 # ============================================================
-# 七、页面公告提取 + 页面状态判定
+# 七、通用公告抓取（不假设table/ul/li具体结构）
 # ============================================================
-def extract_page_records(*, page, code, fund_name, source_url, start_date, end_date):
-    rows = page.locator("table tr")
-    row_count = rows.count()
-    records = []
-    for i in range(row_count):
-        try:
-            cells = rows.nth(i).locator("td")
-            if cells.count() < 2:
-                continue
-            date_text = cells.nth(0).inner_text().strip()
-            try:
-                row_date = datetime.datetime.strptime(date_text, "%Y-%m-%d").date()
-            except ValueError:
-                continue
-            if not (start_date <= row_date <= end_date):
-                continue
-            link = rows.nth(i).locator("a").first
-            if link.count() == 0:
-                continue
-            title = link.inner_text().strip()
-            if not title:
-                continue
-            if not is_limit_title(title):
-                continue
-            href = link.get_attribute("href") or ""
-            if href.startswith("/"):
-                url = "https://fundf10.eastmoney.com" + href
-            elif href.startswith("http"):
-                url = href
-            else:
-                url = source_url
-            records.append({
-                "基金代码": code,
-                "基金名称": fund_name,
-                "公告日期": date_text,
-                "公告标题": title,
-                "公告链接": url,
-            })
-        except Exception:
-            continue
-    return records
+def extract_raw_items(page):
+    """
+    通用抓取：只找页面里所有<a>标签，连同它所在的行/列表项容器
+    (tr、li、常见公告容器class、或直接父元素)一起返回原始文字，
+    不对页面具体是table还是ul/li做任何假设。
 
-
-def count_dated_rows(page):
-    """统计页面上带 yyyy-mm-dd 日期的表格单元格数。
-    公告数据由Ajax加载——日期行存在=数据真的到了;日期行为0=表格没加载出来。"""
+    ★ v3.3核心修复点：v3.2 只认<table><tr><td>结构，
+    如果公告列表实际是<ul><li>或其他容器就会一条都抓不到。
+    """
     try:
-        texts = page.locator("table td").all_inner_texts()
-    except Exception:
-        return 0
-    return sum(1 for t in texts if t and re.search(r"\d{4}-\d{2}-\d{2}", t))
+        raw_items = page.evaluate(
+            r"""
+            () => {
+                const result = [];
+                const links = Array.from(document.querySelectorAll("a"));
+                const clean = (value) => {
+                    return String(value || "")
+                        .replace(/[\s\u3000]+/g, "")
+                        .trim();
+                };
+                for (const link of links) {
+                    const title = clean(link.innerText || link.textContent);
+                    if (!title) continue;
+                    let row = link.closest("tr");
+                    if (!row) row = link.closest("li");
+                    if (!row) row = link.closest(".list-item, .notice-item, .item, .box, .jjgg, .fundNoticeList");
+                    if (!row) row = link.parentElement;
+                    if (!row) row = link;
+                    const rowText = clean(row.innerText || row.textContent);
+                    const href = link.getAttribute("href") || "";
+                    result.push({ title: title, rowText: rowText, href: href });
+                }
+                return result;
+            }
+            """
+        )
+    except Exception as error:
+        logger.info("      页面公告提取失败：%s", error)
+        return []
+    return raw_items or []
 
 
-def collect_window_titles(page, start_date, end_date):
-    """收集窗口内所有公告标题(无论是否命中关键词),用于诊断漏抓"""
-    titles = []
-    rows = page.locator("table tr")
-    for i in range(rows.count()):
-        try:
-            cells = rows.nth(i).locator("td")
-            if cells.count() < 2:
-                continue
-            date_text = cells.nth(0).inner_text().strip()
-            row_date = datetime.datetime.strptime(date_text, "%Y-%m-%d").date()
-            if not (start_date <= row_date <= end_date):
-                continue
-            link = rows.nth(i).locator("a").first
-            if link.count() == 0:
-                continue
-            title = link.inner_text().strip()
-            if title:
-                titles.append((date_text, title))
-        except Exception:
+def parse_records_from_raw_items(raw_items, code, fund_name, source_url, start_date, end_date):
+    """
+    从 extract_raw_items 抓到的原始条目里，解析出：
+    - dated_item_count：窗口无关的、能解析出日期的条目总数（用于判断页面是否真的加载了公告数据）
+    - window_titles：落在日期窗口内的全部公告标题（无论是否命中关键词，用于诊断漏抓）
+    - records：落在日期窗口内 且 命中限额关键词的公告（真正要推送/导出的）
+    """
+    dated_item_count = 0
+    window_titles = []
+    records = []
+
+    for item in raw_items:
+        title = normalize_title(item.get("title", ""))
+        row_text = clean_text(item.get("rowText", ""))
+        href = item.get("href", "") or ""
+
+        if len(title) < 8:
             continue
-    return titles
+
+        # 优先从整行文字找日期，找不到再退回标题本身
+        announcement_date = parse_date(row_text)
+        if announcement_date is None:
+            announcement_date = parse_date(title)
+
+        if announcement_date is None:
+            continue
+
+        # 只要能解析出日期，就算作"页面确实加载出了公告数据"的证据，
+        # 不管这条公告是否落在时间窗口内、是否命中关键词
+        dated_item_count += 1
+
+        if not (start_date <= announcement_date <= end_date):
+            continue
+
+        window_titles.append((format_date(announcement_date), title))
+
+        if not is_limit_title(title):
+            continue
+
+        if href.startswith("/"):
+            url = "https://fundf10.eastmoney.com" + href
+        elif href.startswith("http"):
+            url = href
+        else:
+            url = source_url
+
+        records.append({
+            "基金代码": code,
+            "基金名称": fund_name,
+            "公告日期": format_date(announcement_date),
+            "公告标题": title,
+            "公告链接": url,
+        })
+
+    return dated_item_count, window_titles, records
 
 
 def save_debug_snapshot(page, code, tag):
@@ -313,7 +384,7 @@ def save_debug_snapshot(page, code, tag):
 
 
 # ============================================================
-# 八、单只基金查询(日期行判定+表格等待+翻页+未命中诊断+失败留证)
+# 八、单只基金查询(通用抓取+重试+翻页+未命中诊断+失败留证)
 # ============================================================
 def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
     code = str(code).zfill(6)
@@ -324,25 +395,22 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
         try:
             page.goto(source_url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
 
-            # 等公告表格骨架出现(尽力等待,超时不报错,后面还有日期行判定兜底)
+            # 等页面里出现<a>标签(尽力等待,超时不报错,后面还有dated_item_count判定兜底)
             try:
-                page.wait_for_selector("table tr", state="attached",
-                                       timeout=TABLE_WAIT_TIMEOUT)
+                page.wait_for_selector("a", state="attached", timeout=TABLE_WAIT_TIMEOUT)
             except Exception:
                 pass
-            page.wait_for_timeout(800)  # 表格出现后给数据渲染留缓冲
+            page.wait_for_timeout(800)  # 出现<a>后给Ajax数据渲染留缓冲
 
-            records = extract_page_records(
-                page=page, code=code, fund_name=fund_name,
-                source_url=source_url, start_date=start_date, end_date=end_date,
+            raw_items = extract_raw_items(page)
+            dated_item_count, window_titles, records = parse_records_from_raw_items(
+                raw_items, code, fund_name, source_url, start_date, end_date
             )
 
-            # ★ 核心判定:公告数据是否真的加载了
-            dated_rows = count_dated_rows(page)
-            if dated_rows == 0:
-                # 页面外壳有了但公告数据没到 = 页面异常,重试
+            # ★ 核心判定:公告数据是否真的加载了（不限定table还是ul/li结构）
+            if dated_item_count == 0:
                 if attempt < MAX_ATTEMPTS:
-                    logger.info("  第%d次页面异常（公告表格未加载，日期行0条），%d秒后重试...",
+                    logger.info("  第%d次页面异常（未解析到任何带日期的公告条目），%d秒后重试...",
                                 attempt, RETRY_WAIT_SECONDS)
                     time.sleep(RETRY_WAIT_SECONDS)
                     continue
@@ -350,9 +418,6 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
                 logger.info("没有找到额度相关公告：%s %s（连续%d次页面异常，已存debug截图）",
                             code, fund_name, MAX_ATTEMPTS)
                 return []
-
-            # 收集窗口内全部公告标题(诊断用)
-            window_titles = collect_window_titles(page, start_date, end_date)
 
             # 第1页正常:翻页继续抓(最多 MAX_PAGES 页,翻不动就停)
             for _page_no in range(2, MAX_PAGES + 1):
@@ -362,13 +427,13 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
                         break
                     next_btn.first.click()
                     page.wait_for_timeout(1200)  # 翻页后等Ajax刷新
-                    records.extend(extract_page_records(
-                        page=page, code=code, fund_name=fund_name,
-                        source_url=source_url,
-                        start_date=start_date, end_date=end_date,
-                    ))
-                    window_titles.extend(collect_window_titles(
-                        page, start_date, end_date))
+
+                    more_raw_items = extract_raw_items(page)
+                    _more_dated, more_window_titles, more_records = parse_records_from_raw_items(
+                        more_raw_items, code, fund_name, source_url, start_date, end_date
+                    )
+                    records.extend(more_records)
+                    window_titles.extend(more_window_titles)
                 except Exception:
                     break  # 翻页失败静默停止,不影响已抓到的
 
@@ -386,7 +451,7 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
                 for r in records:
                     logger.info("- %s %s", r["公告日期"], r["公告标题"])
             else:
-                # 有日期行但没命中关键词 = 打出窗口内全部标题,便于诊断
+                # 有日期条目但没命中关键词 = 打出窗口内全部标题,便于诊断
                 shown = set()
                 for d, t in window_titles:
                     if (d, t) in shown:
