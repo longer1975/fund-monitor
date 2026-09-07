@@ -1,14 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-QDII 基金限额公告监控脚本 v3.5
-- 逐只打开天天基金公告页,抓取“过去2天 + 未来4天”窗口内的限额/限购相关公告
-- 通用抓取：不假设 table/ul/li DOM，抓取公告列表区域内 <a>，从其“最近行容器”解析日期
-- 与 seen_announcements.json 对比去重，只推送新增；推送成功后才更新记录(事务性)
-- v3.5 优化点：
-  1) 降低 Page.goto 超时：分级 timeout + 指数退避重试
-  2) 提升加载速度/稳定性：拦截 image/font/media 资源请求
-  3) 翻页提前停止：若当前页“最早日期 < start_date”，停止继续翻页
-  4) 翻页按钮更稳：仅点击可见且非 disabled 的“下一页”
+QDII 基金限额公告监控脚本 v3.6
+- 逐只打开天天基金公告页,抓取"过去2天 + 未来4天"窗口内的限额/限购相关公告
+- 通用抓取：不假设 table/ul/li DOM，抓取公告列表区域内 <a>，从其"最近行容器"解析日期
+
+v3.6 相比 v3.5 的改动：
+
+1) ★最重要：从"53只基金全跑完才统一推送一次"改成"每查完一只基金，
+   立刻判断这只有没有新公告，有就马上推送+写入已见记录"。
+   原来的写法如果跑到中途被 GitHub Actions 的 15 分钟超时强制杀掉，
+   前面已经抓到的新公告会跟着一起丢失、你也收不到提醒；改成按基金
+   为单位后，只要这只基金处理完了，它的新公告就已经安全落地。
+
+2) 恢复"赎回噪音过滤"：QDII基金几乎每天都可能因为境外市场节假日/
+   估值不确定，发布"XX年X月X日暂停申购、赎回及定期定额投资业务"这类
+   常规通知，标题里同时出现"申购"和"赎回"但并不代表真的调整了限额。
+   现在的规则是：标题里如果同时出现"赎回"，又没有"大额/限购/限额/
+   限制/上限/金额/额度"这类真正表示限购限额的字眼，就判定为常规通知
+   予以排除，避免刷屏。
+
+3) 加入运行时间预算（软死线）：本轮运行超过 SOFT_DEADLINE_SECONDS后，
+   不再继续查剩下的基金，而是直接结束本轮、保存已有结果。因为查询窗口
+   本身覆盖"过去2天+未来4天"，这一轮没查完的基金，下一轮还会覆盖到，
+   不会被永久漏掉；但可以避免被 workflow 的 timeout-minutes 硬杀死、
+   导致 Excel/已见记录写到一半或者干脆没保存。
+
+4) 缩短 goto 超时上限（90秒一次太长了，正常公告页几秒内就能加载完，
+   等这么久基本等于在浪费本来就紧张的15分钟预算），改成更合理的区间。
 """
 
 # ============================================================
@@ -29,8 +47,8 @@ from playwright.sync_api import sync_playwright
 
 APP_DIR = pathlib.Path(__file__).resolve().parent
 
-FUND_LIST_CSV = APP_DIR / "fund_list.csv"                # 基金清单(可选,存在则优先)
-SEEN_RECORD_FILE = APP_DIR / "seen_announcements.json"   # 已推送记录(持久化到仓库)
+FUND_LIST_CSV = APP_DIR / "fund_list.csv"          # 基金清单(可选,存在则优先)
+SEEN_RECORD_FILE = APP_DIR / "seen_announcements.json"  # 已推送记录(持久化到仓库)
 EXCEL_FILE = APP_DIR / "限额公告.xlsx"
 LOG_FILE = APP_DIR / "fund_monitor.log"
 
@@ -39,15 +57,20 @@ PAST_DAYS = 2
 FUTURE_DAYS = 4
 
 # 基础超时/重试
-PAGE_TIMEOUT = 30000       # 单页导航基础超时(毫秒)；v3.5 会按 attempt 动态放大
-GOTO_TIMEOUTS = [30000, 60000, 90000]  # 第1/2/3次 goto 超时
+# v3.6：90秒一次goto太长了，正常公告页几秒能加载完，缩短上限，
+# 把省下来的时间留给后面的基金，减少被workflow超时强杀的概率
+GOTO_TIMEOUTS = [12000, 20000, 30000]  # 第1/2/3次 goto 超时(毫秒)
 MAX_ATTEMPTS = 3           # 页面异常时最大尝试次数
-RETRY_WAIT_SECONDS = 2     # 兜底等待(某些分支仍用)，主要退避逻辑见 backoff_sleep
 MAX_PAGES = 3              # 每只基金最多翻页数（仍保留硬上限，避免极端情况）
 TABLE_WAIT_TIMEOUT = 8000  # 等待公告列表骨架渲染的超时(毫秒)
 DEBUG_DIR = APP_DIR / "debug"   # 页面异常时的截图/HTML留证目录
 
-MAX_DIAG_TITLES = 30       # 未命中关键词时，窗口内标题最多打印多少条（防日志爆）
+MAX_DIAG_TITLES = 30  # 未命中关键词时，窗口内标题最多打印多少条（防日志爆）
+
+# v3.6新增：运行时间预算（软死线），单位秒。
+# workflow 的 timeout-minutes 建议设15分钟，这里留够导出Excel、
+# git提交推送的余量，实际抓取阶段最多跑到这个时长就主动收尾。
+SOFT_DEADLINE_SECONDS = 11 * 60
 
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
 
@@ -58,7 +81,7 @@ REQUEST_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9",
 }
 
-# 更严格的“限额/限购”关键词（强匹配，减少误抓）
+# 限额/限购关键词（子串匹配，命中任意一个即视为"可能相关"）
 LIMIT_KEYWORDS_STRICT = [
     "限购", "限额", "限大额", "大额申购",
     "暂停申购", "恢复申购",
@@ -68,13 +91,23 @@ LIMIT_KEYWORDS_STRICT = [
     "暂停转换转入", "恢复转换转入",
 ]
 
-# 明确排除：这些通常不是“限额/限购”类
+# v3.6：真正表示"限购/限额调整"的强信号词。
+# 标题里如果同时出现"赎回"，必须再命中下面任意一个词，才认定是
+# 真正的限额公告；否则判定为"境外市场节假日/估值不确定导致的
+# 当天暂停申购赎回"这类常规通知，予以排除。
+STRONG_LIMIT_SIGNALS = ["大额", "限购", "限额", "限制", "上限", "金额", "额度"]
+
+# 明确排除：这些通常不是"限额/限购"类
 EXCLUDE_KEYWORDS = [
     "年度报告", "中期报告", "季度报告", "定期报告",
     "招募说明书", "更新招募说明书", "基金合同", "托管协议",
     "分红", "收益分配",
     "净值", "临时公告",
     "基金经理", "经理变更",
+    "节假日", "市场节假日",
+    "暂停申购赎回安排", "暂停赎回安排", "申购赎回安排",
+    "开放日安排", "交易日安排",
+    "清明节", "劳动节", "端午节", "中秋节", "国庆节", "春节", "元旦",
 ]
 
 
@@ -98,33 +131,7 @@ except Exception:
 # ============================================================
 # 三、基金清单加载
 # ============================================================
-def load_fund_dict():
-    """优先读 fund_list.csv(代码,名称);不存在则用脚本内置完整列表"""
-    if FUND_LIST_CSV.exists():
-        try:
-            df = pd.read_csv(FUND_LIST_CSV, dtype=str)
-            df.columns = [str(c).strip() for c in df.columns]
-            code_col = next((c for c in df.columns
-                             if c in ("代码", "code", "基金代码")), df.columns[0])
-            name_col = next((c for c in df.columns
-                             if c in ("名称", "name", "基金名称", "简称")), df.columns[1])
-            fund_dict = {}
-            for _, row in df.iterrows():
-                code = str(row[code_col]).strip().split(".")[0].zfill(6)
-                name = str(row[name_col]).strip()
-                if code and code != "nan":
-                    fund_dict[code] = name
-            logger.info("已从 %s 读取 %d 只基金", FUND_LIST_CSV.name, len(fund_dict))
-            return fund_dict
-        except Exception as e:
-            logger.info("读取基金列表失败(%s),改用脚本内置列表", e)
-    else:
-        logger.info("未找到 %s,使用脚本内置列表(%d只)",
-                    FUND_LIST_CSV.name, len(FALLBACK_FUND_DICT))
-    return dict(FALLBACK_FUND_DICT)
-
-
-# ★ 完整基金列表(53只)——仅当仓库里不存在 fund_list.csv 时使用
+# 完整基金列表(53只)——仅当仓库里不存在 fund_list.csv 时使用
 FALLBACK_FUND_DICT = {
     # ---- 全球/其他 QDII(29只)----
     "017730": "嘉实全球产业升级",
@@ -185,11 +192,37 @@ FALLBACK_FUND_DICT = {
 }
 
 
+def load_fund_dict():
+    """优先读 fund_list.csv(代码,名称);不存在则用脚本内置完整列表"""
+    if FUND_LIST_CSV.exists():
+        try:
+            df = pd.read_csv(FUND_LIST_CSV, dtype=str)
+            df.columns = [str(c).strip() for c in df.columns]
+            code_col = next((c for c in df.columns
+                             if c in ("代码", "code", "基金代码")), df.columns[0])
+            name_col = next((c for c in df.columns
+                             if c in ("名称", "name", "基金名称", "简称")), df.columns[1])
+            fund_dict = {}
+            for _, row in df.iterrows():
+                code = str(row[code_col]).strip().split(".")[0].zfill(6)
+                name = str(row[name_col]).strip()
+                if code and code != "nan":
+                    fund_dict[code] = name
+            logger.info("已从 %s 读取 %d 只基金", FUND_LIST_CSV.name, len(fund_dict))
+            return fund_dict
+        except Exception as e:
+            logger.info("读取基金列表失败(%s),改用脚本内置列表", e)
+    else:
+        logger.info("未找到 %s,使用脚本内置列表(%d只)",
+                    FUND_LIST_CSV.name, len(FALLBACK_FUND_DICT))
+    return dict(FALLBACK_FUND_DICT)
+
+
 # ============================================================
 # 四、日期窗口 + 文字/日期处理
 # ============================================================
 def fetch_window_dates(past_days, future_days):
-    """返回窗口日期：[今天- past_days, 今天+ future_days]（含端点）"""
+    """返回窗口日期：[今天-past_days, 今天+future_days]（含端点）"""
     today = datetime.date.today()
     start_date = today - datetime.timedelta(days=past_days)
     end_date = today + datetime.timedelta(days=future_days)
@@ -238,11 +271,26 @@ def format_date(value):
 
 
 def is_limit_title(title):
-    """判断公告标题是否限额相关（强匹配 + 排除项）"""
+    """
+    判断公告标题是否限额相关。
+
+    v3.6：恢复"赎回噪音过滤"——标题里如果同时出现"赎回"，
+    又没有命中 STRONG_LIMIT_SIGNALS 里的任何一个真正表示限购限额的
+    字眼，判定为境外市场节假日/估值不确定导致的常规"当天暂停申购
+    赎回"通知，不算限额公告，予以排除。
+    """
     t = normalize_title(title)
+
     if any(x in t for x in EXCLUDE_KEYWORDS):
         return False
-    return any(k in t for k in LIMIT_KEYWORDS_STRICT)
+
+    if not any(k in t for k in LIMIT_KEYWORDS_STRICT):
+        return False
+
+    if "赎回" in t and not any(k in t for k in STRONG_LIMIT_SIGNALS):
+        return False
+
+    return True
 
 
 # ============================================================
@@ -264,17 +312,23 @@ def save_seen_records(seen_set):
         json.dump(sorted(seen_set), f, ensure_ascii=False, indent=2)
 
 
+def make_key(record):
+    return f"{record['基金代码']}|{record['公告日期']}|{record['公告标题']}"
+
+
 # ============================================================
 # 六、飞书推送(文本消息)
 # ============================================================
 def send_feishu(new_records):
+    if not new_records:
+        return
     if not FEISHU_WEBHOOK_URL:
         logger.info("未配置飞书 Webhook,跳过推送")
         return
     new_count = len(new_records)
     lines = [f"发现新的限额公告：{new_count}条"]
     for r in new_records:
-        lines.append(f"- {r['基金代码']} {r['公告日期']} {r['公告标题']}")
+        lines.append(f"- {r['基金代码']} {r['基金名称']} {r['公告日期']} {r['公告标题']}")
         lines.append(f"  {r['公告链接']}")
     payload = {"msg_type": "text", "content": {"text": "\n".join(lines)}}
     resp = requests.post(FEISHU_WEBHOOK_URL, json=payload, timeout=10)
@@ -289,7 +343,7 @@ def send_feishu(new_records):
 # ============================================================
 def extract_raw_items(page):
     """
-    通用抓取：尽量限定在“公告列表区域”内找 <a>，找不到再退回整页；
+    通用抓取：尽量限定在"公告列表区域"内找 <a>，找不到再退回整页；
     同时过滤明显不是详情链接的 href（# / javascript: / 空）
     """
     try:
@@ -297,32 +351,24 @@ def extract_raw_items(page):
             r"""
             () => {
                 const result = [];
-
                 const clean = (value) => {
                     return String(value || "")
                         .replace(/[\s\u3000]+/g, "")
                         .trim();
                 };
-
-                // 尽量把范围限定在“公告列表”附近（不同基金页结构不一）
                 const scope =
                     document.querySelector("#jjgg, .jjgg, .fundNoticeList, #gg, .gg, .txt_in")
                     || document;
-
                 const links = Array.from(scope.querySelectorAll("a"));
-
                 for (const link of links) {
                     const title = clean(link.innerText || link.textContent);
                     if (!title) continue;
-
                     const href = (link.getAttribute("href") || "").trim();
                     if (!href || href === "#" || href.toLowerCase().startsWith("javascript:")) continue;
-
                     let row = link.closest("tr") || link.closest("li");
                     if (!row) row = link.closest(".list-item, .notice-item, .item, .box");
                     if (!row) row = link.parentElement;
                     if (!row) row = link;
-
                     const rowText = clean(row.innerText || row.textContent);
                     result.push({ title: title, rowText: rowText, href: href });
                 }
@@ -342,7 +388,7 @@ def parse_records_from_raw_items(raw_items, code, fund_name, source_url, start_d
     - dated_item_count：能解析出日期的条目数（用于判定公告是否加载）
     - window_titles：落在日期窗口内的全部公告标题（无论是否命中关键词，用于诊断漏抓）
     - records：落在日期窗口内 且 命中限额关键词的公告（真正要推送/导出的）
-    - min_date_in_page：该页所有“可解析日期条目”的最早日期（用于翻页提前停止）
+    - min_date_in_page：该页所有"可解析日期条目"的最早日期（用于翻页提前停止）
     """
     dated_item_count = 0
     window_titles = []
@@ -357,7 +403,6 @@ def parse_records_from_raw_items(raw_items, code, fund_name, source_url, start_d
         if len(title) < 8:
             continue
 
-        # 优先从整行文字找日期，找不到再退回标题本身
         announcement_date = parse_date(row_text) or parse_date(title)
         if announcement_date is None:
             continue
@@ -414,10 +459,7 @@ def backoff_sleep(attempt_index_zero_based: int):
 
 
 def find_clickable_next_button(page):
-    """
-    更稳健地找“下一页”：必须可见，并且 class/aria-disabled 不像 disabled。
-    返回 locator 或 None
-    """
+    """更稳健地找"下一页"：必须可见，并且 class/aria-disabled 不像 disabled。"""
     candidates = page.locator("a", has_text="下一页")
     try:
         n = candidates.count()
@@ -454,7 +496,6 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
             timeout = GOTO_TIMEOUTS[min(attempt, len(GOTO_TIMEOUTS) - 1)]
             page.goto(source_url, wait_until="domcontentloaded", timeout=timeout)
 
-            # 等页面里出现<a>标签(尽力等待,超时不报错,后面还有 dated_item_count 判定兜底)
             try:
                 page.wait_for_selector("a", state="attached", timeout=TABLE_WAIT_TIMEOUT)
             except Exception:
@@ -466,7 +507,6 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
                 raw_items, code, fund_name, source_url, start_date, end_date
             )
 
-            # 公告数据是否真的加载了
             if dated_item_count == 0:
                 if attempt < MAX_ATTEMPTS - 1:
                     logger.info("  第%d次页面异常（未解析到任何带日期的公告条目），退避后重试...",
@@ -478,22 +518,18 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
                             code, fund_name, MAX_ATTEMPTS)
                 return []
 
-            # 第1页正常：翻页继续抓（最多 MAX_PAGES 页；若该页最早日期 < start_date 则提前停止）
             if (min_date_in_page is not None) and (min_date_in_page < start_date):
-                # 第一页已经早于窗口，说明窗口期公告很少/没有，不用翻
                 pass
             else:
                 for _page_no in range(2, MAX_PAGES + 1):
                     next_btn = find_clickable_next_button(page)
                     if next_btn is None:
                         break
-
                     try:
                         next_btn.click()
                     except Exception:
                         break
 
-                    # 翻页后等 Ajax 刷新
                     try:
                         page.wait_for_selector("a", state="attached", timeout=TABLE_WAIT_TIMEOUT)
                     except Exception:
@@ -507,11 +543,9 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
                     records.extend(more_records)
                     window_titles.extend(more_window_titles)
 
-                    # 提前停止条件：这一页最早日期已经早于窗口起点
                     if (more_min_date is not None) and (more_min_date < start_date):
                         break
 
-            # 翻页可能造成跨页重复：去重
             unique, seen_keys = [], set()
             for r in records:
                 k = (r["基金代码"], r["公告日期"], r["公告标题"])
@@ -525,7 +559,6 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
                 for r in records:
                     logger.info("- %s %s", r["公告日期"], r["公告标题"])
             else:
-                # 有日期条目但没命中关键词：打印窗口内部分标题用于诊断（限量）
                 shown = set()
                 printed = 0
                 for d, t in window_titles:
@@ -554,22 +587,57 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
 
 # ============================================================
 # 九、全量查询
+# v3.6核心改动：不再"全部查完再统一推送"，改成每查完一只基金
+# 立刻判断新公告、立刻推送+写入已见记录，避免中途被超时杀掉时
+# 已经抓到的新公告白白丢失。同时加入运行时间预算，快到期时提前
+# 收尾，剩下的基金留给下一轮（查询窗口本身有过去2天余量，不会
+# 永久漏掉）。
 # ============================================================
-def query_all_funds(page, fund_dict, start_date, end_date):
+def query_all_funds(page, fund_dict, start_date, end_date, seen, deadline_ts):
     total = len(fund_dict)
     all_records = []
+    processed_count = 0
+
     for idx, (code, name) in enumerate(fund_dict.items(), start=1):
-        all_records.extend(
-            query_one_fund(page, idx, total, code, name, start_date, end_date)
-        )
-        time.sleep(random.uniform(0.8, 1.8))  # 每只之间随机间隔,降低风控概率
-    return all_records
+        if time.time() >= deadline_ts:
+            remaining = total - processed_count
+            logger.info("已接近本轮时间预算上限，提前结束本轮，剩余%d只基金留给下一轮继续检查",
+                        remaining)
+            break
+
+        records = query_one_fund(page, idx, total, code, name, start_date, end_date)
+        all_records.extend(records)
+        processed_count += 1
+
+        # 立刻判断这只基金有没有新公告，有就马上推送+写入已见记录
+        new_records_this_fund = []
+        for r in records:
+            key = make_key(r)
+            if key not in seen:
+                r["_key"] = key
+                new_records_this_fund.append(r)
+
+        if new_records_this_fund:
+            logger.info("发现新的限额公告：%d条（%s %s）", len(new_records_this_fund), code, name)
+            try:
+                send_feishu(new_records_this_fund)
+                seen.update(r["_key"] for r in new_records_this_fund)
+                save_seen_records(seen)
+            except Exception as e:
+                logger.info("推送失败(%s)，本条记录不写入历史，下轮自动重试", e)
+
+        time.sleep(random.uniform(0.8, 1.8))
+
+    return all_records, processed_count
 
 
 # ============================================================
 # 十、主流程
 # ============================================================
 def main():
+    start_time = time.time()
+    deadline_ts = start_time + SOFT_DEADLINE_SECONDS
+
     start_date, end_date = fetch_window_dates(PAST_DAYS, FUTURE_DAYS)
     logger.info("本次检查窗口：%s ~ %s（过去%d天 + 未来%d天）",
                 start_date, end_date, PAST_DAYS, FUTURE_DAYS)
@@ -578,6 +646,8 @@ def main():
     seen = load_seen_records()
 
     all_records = []
+    processed_count = 0
+
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -590,7 +660,6 @@ def main():
         )
         context = browser.new_context(user_agent=REQUEST_HEADERS["User-Agent"])
 
-        # v3.5：拦截不必要资源，提升加载速度/稳定性（对公告文本抓取通常足够）
         def block_unneeded(route):
             try:
                 r = route.request
@@ -603,45 +672,25 @@ def main():
         context.route("**/*", block_unneeded)
 
         page = context.new_page()
-        # 让 Playwright 的默认超时也更合理（可选）
         page.set_default_timeout(30000)
-        page.set_default_navigation_timeout(90000)
+        page.set_default_navigation_timeout(30000)
 
         try:
-            all_records = query_all_funds(page, fund_dict, start_date, end_date)
+            all_records, processed_count = query_all_funds(
+                page, fund_dict, start_date, end_date, seen, deadline_ts
+            )
         finally:
             browser.close()
 
-    # 保存 Excel(无论是否有公告都生成,便于 artifact 查看全量)
+    # 保存 Excel(无论是否有公告都生成,便于 artifact 查看全量；
+    # 即使因为时间预算提前收尾，也只会缺剩余未查基金的数据，不影响已查部分)
     df = pd.DataFrame(all_records, columns=["基金代码", "基金名称", "公告日期", "公告标题", "公告链接"])
     df.to_excel(EXCEL_FILE, index=False)
-    logger.info("Excel已保存：%s", EXCEL_FILE)
 
-    # 对比已见记录,筛出新公告
-    new_records = []
-    for r in all_records:
-        key = f"{r['基金代码']}|{r['公告日期']}|{r['公告标题']}"
-        if key not in seen:
-            r["_key"] = key
-            new_records.append(r)
-
-    if not new_records:
-        logger.info("本轮没有新的限额公告")
-        return
-
-    logger.info("发现新的限额公告：%d条", len(new_records))
-    for r in new_records:
-        logger.info("- %s %s %s", r["基金代码"], r["公告日期"], r["公告标题"])
-
-    try:
-        send_feishu(new_records)
-    except Exception as e:
-        logger.info("推送失败(%s),记录不更新,下轮自动重试", e)
-        return
-
-    # 只有推送成功才写记录(事务性)
-    seen.update(r["_key"] for r in new_records)
-    save_seen_records(seen)
+    elapsed = time.time() - start_time
+    logger.info("Excel已保存：%s（本轮共检查%d/%d只基金，耗时%.0f秒）",
+                EXCEL_FILE, processed_count, len(fund_dict), elapsed)
+    logger.info("本轮结束（新公告已在查询过程中逐只推送完毕，此处不再重复推送）")
 
 
 if __name__ == "__main__":
