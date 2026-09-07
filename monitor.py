@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-QDII 基金限额公告监控脚本 v3.1
+QDII 基金限额公告监控脚本 v3.2
 - 逐只打开天天基金公告页,抓取近 N 天限额相关公告
-- 页面正常判据:表格里存在带日期的数据行(不再依赖链接数,根治AJAX慢加载误判)
+- 页面正常判据:表格里存在带日期的数据行(根治AJAX慢加载误判)
+- 关键词采用宽覆盖子串匹配(兼容"限购/限大额/大额申购"等各种写法)
 - 支持翻页抓取(最多3页,防公告大户单页漏抓)
+- 未命中关键词时打印窗口内全部公告标题(诊断漏抓)
 - 与 seen_announcements.json 对比,新公告推送飞书
 - 推送成功后才更新已见记录(事务性,失败自动下轮重试)
 """
@@ -47,16 +49,21 @@ REQUEST_HEADERS = {
     "Accept-Language": "zh-CN,zh;q=0.9",
 }
 
-# 限额公告关键词(正则,命中任意一条即保留)
-KEYWORD_PATTERNS = [
-    re.compile(r"调整.{0,25}大额申购"),
-    re.compile(r"暂停(大额)?(申购|定期定额)"),
-    re.compile(r"(申购|定期定额).{0,10}限制"),
-    re.compile(r"限制(大额)?(申购|定期定额).{0,10}金额"),
-    re.compile(r"恢复(大额)?(申购|定期定额)"),
-    re.compile(r"规模上限"),
-    re.compile(r"单日.{0,10}(金额|上限)"),
+# 限额公告关键词(子串匹配,命中任意一个即保留,覆盖各种写法)
+LIMIT_KEYWORDS = [
+    "限购", "限额", "限大额",
+    "大额申购", "限制申购", "申购限制",
+    "暂停申购", "恢复申购", "申购上限",
+    "申购金额", "单日申购", "单日累计",
+    "暂停定投", "暂停定期定额", "恢复定期定额",
+    "规模上限", "单日上限",
 ]
+
+
+def is_limit_title(title):
+    """判断公告标题是否限额相关(子串匹配,覆盖面比正则广)"""
+    return any(k in title for k in LIMIT_KEYWORDS)
+
 
 # ★ 完整基金列表(53只)——仅当仓库里不存在 fund_list.csv 时使用
 FALLBACK_FUND_DICT = {
@@ -238,7 +245,7 @@ def extract_page_records(*, page, code, fund_name, source_url, start_date, end_d
             title = link.inner_text().strip()
             if not title:
                 continue
-            if not any(p.search(title) for p in KEYWORD_PATTERNS):
+            if not is_limit_title(title):
                 continue
             href = link.get_attribute("href") or ""
             if href.startswith("/"):
@@ -269,6 +276,30 @@ def count_dated_rows(page):
     return sum(1 for t in texts if t and re.search(r"\d{4}-\d{2}-\d{2}", t))
 
 
+def collect_window_titles(page, start_date, end_date):
+    """收集窗口内所有公告标题(无论是否命中关键词),用于诊断漏抓"""
+    titles = []
+    rows = page.locator("table tr")
+    for i in range(rows.count()):
+        try:
+            cells = rows.nth(i).locator("td")
+            if cells.count() < 2:
+                continue
+            date_text = cells.nth(0).inner_text().strip()
+            row_date = datetime.datetime.strptime(date_text, "%Y-%m-%d").date()
+            if not (start_date <= row_date <= end_date):
+                continue
+            link = rows.nth(i).locator("a").first
+            if link.count() == 0:
+                continue
+            title = link.inner_text().strip()
+            if title:
+                titles.append((date_text, title))
+        except Exception:
+            continue
+    return titles
+
+
 def save_debug_snapshot(page, code, tag):
     """页面异常时保存截图和HTML,便于排查"""
     try:
@@ -282,7 +313,7 @@ def save_debug_snapshot(page, code, tag):
 
 
 # ============================================================
-# 八、单只基金查询(v3.1:日期行判定+表格等待+翻页+失败留证)
+# 八、单只基金查询(日期行判定+表格等待+翻页+未命中诊断+失败留证)
 # ============================================================
 def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
     code = str(code).zfill(6)
@@ -320,6 +351,9 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
                             code, fund_name, MAX_ATTEMPTS)
                 return []
 
+            # 收集窗口内全部公告标题(诊断用)
+            window_titles = collect_window_titles(page, start_date, end_date)
+
             # 第1页正常:翻页继续抓(最多 MAX_PAGES 页,翻不动就停)
             for _page_no in range(2, MAX_PAGES + 1):
                 try:
@@ -333,6 +367,8 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
                         source_url=source_url,
                         start_date=start_date, end_date=end_date,
                     ))
+                    window_titles.extend(collect_window_titles(
+                        page, start_date, end_date))
                 except Exception:
                     break  # 翻页失败静默停止,不影响已抓到的
 
@@ -350,7 +386,13 @@ def query_one_fund(page, index, total, code, fund_name, start_date, end_date):
                 for r in records:
                     logger.info("- %s %s", r["公告日期"], r["公告标题"])
             else:
-                # 有日期行但没匹配公告 = 真没有
+                # 有日期行但没命中关键词 = 打出窗口内全部标题,便于诊断
+                shown = set()
+                for d, t in window_titles:
+                    if (d, t) in shown:
+                        continue
+                    shown.add((d, t))
+                    logger.info("  窗口内公告(未命中关键词)：%s %s", d, t)
                 logger.info("没有找到额度相关公告：%s %s", code, fund_name)
             return records
 
@@ -390,7 +432,11 @@ def main():
 
     all_records = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled",
+                  "--disable-gpu", "--no-sandbox", "--disable-dev-shm-usage"],
+        )
         context = browser.new_context(user_agent=REQUEST_HEADERS["User-Agent"])
         page = context.new_page()
         try:
