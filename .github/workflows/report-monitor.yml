@@ -1,0 +1,96 @@
+name: fund-report-monitor
+
+on:
+  push:
+    paths:
+      - "report_monitor.py"
+      - "report_funds.json"
+      - "report_requirements.txt"
+      - ".github/workflows/report-monitor.yml"
+  schedule:
+    - cron: "7,17,27,37,47,57 * * * *"
+  workflow_dispatch:
+    inputs:
+      send_test:
+        description: "仅发送一条飞书测试消息"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fund-report-monitor
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: report_requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r report_requirements.txt
+
+      - name: Test Feishu
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.send_test }}
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          REPORT_FEISHU_KEYWORD: "基金公告"
+        run: python report_monitor.py --test-feishu
+
+      - name: Scan reports
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.send_test) }}
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          REPORT_FEISHU_KEYWORD: "基金公告"
+          REPORT_NOTIFY_ON_FIRST_RUN: "false"
+        run: python report_monitor.py
+
+      - name: Persist report state
+        if: ${{ success() && !(github.event_name == 'workflow_dispatch' && inputs.send_test) }}
+        shell: bash
+        run: |
+          set -e
+          cp report_state.json /tmp/report_state.json
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git reset --hard origin/main
+            cp /tmp/report_state.json report_state.json
+            git add report_state.json
+
+            if git diff --cached --quiet; then
+              echo "report_state.json 无变化"
+              exit 0
+            fi
+
+            git commit -m "update report monitor state [skip ci]"
+
+            if git push origin HEAD:main; then
+              echo "状态保存成功"
+              exit 0
+            fi
+
+            echo "推送冲突，第 ${attempt} 次重试..."
+            sleep $((attempt * 5))
+          done
+
+          echo "状态文件连续3次推送失败"
+          exit 1
