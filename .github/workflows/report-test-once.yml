@@ -1,0 +1,44 @@
+name: fund-report-feishu-test-once
+
+on:
+  push:
+    paths:
+      - ".github/workflows/report-test-once.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: 发送飞书测试消息
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          url = os.environ.get("FEISHU_WEBHOOK_URL", "").strip()
+          if not url:
+              raise SystemExit("FEISHU_WEBHOOK_URL 未配置")
+
+          payload = json.dumps({
+              "msg_type": "text",
+              "content": {
+                  "text": "【基金公告】\n测试成功：基金季报/中报/年报监控已连接飞书。"
+              }
+          }, ensure_ascii=False).encode("utf-8")
+
+          req = urllib.request.Request(
+              url,
+              data=payload,
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          with urllib.request.urlopen(req, timeout=20) as resp:
+              body = resp.read().decode("utf-8", errors="replace")
+              print(body)
+              if resp.status >= 300:
+                  raise SystemExit(f"飞书HTTP失败: {resp.status}")
+          PY
