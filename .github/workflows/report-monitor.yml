@@ -1,6 +1,8 @@
 name: fund-report-monitor
 
 on:
+  repository_dispatch:
+    types: [fund-monitor-trigger]
   push:
     paths:
       - "report_monitor.py"
