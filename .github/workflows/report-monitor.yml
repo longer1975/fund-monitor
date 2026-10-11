@@ -10,7 +10,7 @@ on:
       - "report_requirements.txt"
       - ".github/workflows/report-monitor.yml"
   schedule:
-    - cron: "7,17,27,37,47,57 * * * *"
+    - cron: "7,27,47 * * * *"
   workflow_dispatch:
     inputs:
       send_test:
@@ -29,7 +29,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 20
 
     steps:
       - name: Checkout
