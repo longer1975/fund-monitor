@@ -160,7 +160,8 @@ def extract_reports(code: str, name: str, df: pd.DataFrame) -> list[Report]:
             )
         )
     reports.sort(key=lambda x: (x.date, x.title), reverse=True)
-    return reports
+    # 每只基金只分析日期最新的一条定期报告；历史报告不再参与比对或通知。
+    return reports[:1]
 
 
 def send_feishu(text: str) -> None:
